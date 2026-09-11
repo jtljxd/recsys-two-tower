@@ -1,66 +1,96 @@
-"""Central configuration for the two-tower retrieval pipeline."""
+"""Central configuration for the Amazon-Electronics two-tower pipeline."""
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
+PROCESSED_DIR = DATA_DIR / "processed"
 ARTIFACT_DIR = PROJECT_ROOT / "artifacts"
 
 
 @dataclass
 class DataConfig:
-    """Controls how interactions are built and split."""
+    """Controls raw parsing, sampling and train/valid/test split."""
 
-    dataset: str = "movielens-100k"  # or "synthetic"
-    # Ratings >= this value are treated as positive implicit feedback.
-    positive_threshold: float = 4.0
-    # Drop users/items with fewer than this many positive interactions.
+    dataset: str = "amazon-electronics"
+
+    # --- raw files (override on the dev box if they live elsewhere) ---
+    reviews_file: str = "reviews_Electronics_5.json.gz"
+    meta_file: str = "meta_Electronics.json.gz"
+
+    # --- sampling: keep the pipeline light for the first run ---
+    # Number of users to sample. None == use every user.
+    sample_users: Optional[int] = 10000
+    # Users must have at least this many interactions to be usable.
+    # leave-one-out needs >= 1 train + 1 valid + 1 test.
     min_user_interactions: int = 5
     min_item_interactions: int = 5
-    # Leave-one-out split: the newest interaction per user becomes the test item,
-    # the second newest becomes validation.
-    holdout_strategy: str = "leave_one_out"
-    # Only used when dataset == "synthetic".
-    synthetic_users: int = 2000
-    synthetic_items: int = 1000
-    synthetic_interactions: int = 60000
+
+    # Ratings >= threshold are positive implicit feedback.
+    positive_threshold: float = 4.0
+
+    # --- behaviour sequence ---
+    max_seq_len: int = 20
+
+    # --- negative sampling ---
+    # Negatives per positive during training.
+    train_negatives: int = 4
+    # Negatives per positive during evaluation (1 pos + N neg ranking).
+    eval_negatives: int = 99
+    # Sampling distribution over items: pop ** alpha. 0 == uniform.
+    neg_sampling_alpha: float = 0.75
+
+    # --- vocabulary pruning ---
+    min_brand_freq: int = 5
+    min_category_freq: int = 5
+
     seed: int = 42
 
 
 @dataclass
 class ModelConfig:
-    embedding_dim: int = 64
-    tower_hidden: tuple = (128, 64)
+    id_embedding_dim: int = 64
+    side_embedding_dim: int = 32
+    dense_hidden: int = 64
+    tower_hidden: Tuple[int, ...] = (256, 128, 64)
     dropout: float = 0.1
-    # L2-normalize tower outputs and scale logits by 1/temperature.
+    # L2-normalize tower outputs; logits are scaled by 1 / temperature.
     normalize: bool = True
     temperature: float = 0.07
-    # Subtract log(item_prob) from logits to correct in-batch sampling bias.
-    use_logq_correction: bool = True
+    learnable_temperature: bool = True
+    # Global scalar bias so normalized dot products can calibrate.
+    use_global_bias: bool = True
 
 
 @dataclass
 class TrainConfig:
+    # "bce" -> pointwise with explicit negatives (gives AUC / logloss).
+    # "softmax" -> in-batch sampled softmax (retrieval oriented).
+    loss_type: str = "bce"
     batch_size: int = 1024
-    epochs: int = 8
+    eval_batch_size: int = 2048
+    epochs: int = 10
     lr: float = 1e-3
     weight_decay: float = 1e-6
     grad_clip: float = 5.0
     num_workers: int = 0
-    eval_every: int = 1
     early_stop_patience: int = 3
+    # Metric watched for early stopping / LR schedule.
+    monitor: str = "auc"
+    lr_scheduler_factor: float = 0.5
+    lr_scheduler_patience: int = 1
     device: Optional[str] = None  # auto: cuda -> mps -> cpu
     seed: int = 42
+    log_every: int = 50
 
 
 @dataclass
 class EvalConfig:
-    ks: tuple = (10, 20, 50)
-    # Exclude items the user already interacted with in train/val.
-    filter_seen: bool = True
+    ks: Tuple[int, ...] = (10, 20, 50)
+    compute_gauc: bool = True
 
 
 @dataclass
@@ -69,11 +99,14 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
+    raw_dir: Path = RAW_DIR
+    processed_dir: Path = PROCESSED_DIR
     artifact_dir: Path = ARTIFACT_DIR
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        d["artifact_dir"] = str(self.artifact_dir)
+        for key in ("raw_dir", "processed_dir", "artifact_dir"):
+            d[key] = str(getattr(self, key))
         return d
 
 

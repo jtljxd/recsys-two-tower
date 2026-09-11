@@ -8,3 +8,5 @@ artifacts/
 .DS_Store
 *.pt
 *.npy
+data/processed/
+data/mock/
