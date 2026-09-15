@@ -91,12 +91,14 @@ def train_one_epoch(
 ) -> float:
     model.train()
     total_loss = 0.0
+    total_mimic = 0.0
+    total_batches = 0
     total_elements = 0
     start = time.time()
 
     for step, batch in enumerate(loader):
         batch = {k: v.to(device) for k, v in batch.items()}
-        logits = model(batch)
+        logits, aux = model.forward_with_aux(batch)
         labels = batch["labels"]
 
         if cfg.train.loss_type == "bce":
@@ -110,26 +112,46 @@ def train_one_epoch(
         else:
             raise ValueError("unknown loss_type: {}".format(cfg.train.loss_type))
 
+        main_loss = float(loss.item())
+        mimic_value = 0.0
+        if aux:
+            mimic = model.dat_loss(aux)
+            mimic_value = float(mimic.item())
+            loss = loss + cfg.model.dat_weight * mimic
+
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if cfg.train.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
         optimizer.step()
 
-        total_loss += float(loss.item()) * labels.numel()
+        # Report the main loss only, so the number stays comparable to the
+        # baseline run regardless of dat_weight.
+        total_loss += main_loss * labels.numel()
         total_elements += labels.numel()
+        total_mimic += mimic_value
+        total_batches += 1
 
         if cfg.train.log_every and step % cfg.train.log_every == 0:
             LOGGER.info(
-                "epoch %d step %d/%d loss=%.4f temp=%.3f",
+                "epoch %d step %d/%d loss=%.4f mimic=%.6f temp=%.3f",
                 epoch,
                 step,
                 len(loader),
-                float(loss.item()),
+                main_loss,
+                mimic_value,
                 float(model.temperature.item()),
             )
 
-    LOGGER.info("epoch %d finished in %.1fs", epoch, time.time() - start)
+    if total_mimic:
+        LOGGER.info(
+            "epoch %d finished in %.1fs | mean mimic=%.6f",
+            epoch,
+            time.time() - start,
+            total_mimic / max(total_batches, 1),
+        )
+    else:
+        LOGGER.info("epoch %d finished in %.1fs", epoch, time.time() - start)
     return total_loss / max(total_elements, 1)
 
 
@@ -143,7 +165,13 @@ def run(cfg: Optional[Config] = None, raw_dir: Optional[str] = None, force: bool
     train_loader, valid_loader, test_loader = build_dataloaders(store, enc, cfg)
 
     model = build_model(enc, store.dense.shape[1], cfg).to(device)
-    LOGGER.info("model parameters: %d", count_parameters(model))
+    LOGGER.info(
+        "model: %s | parameters: %d",
+        "dat" if cfg.model.use_dat else "base",
+        count_parameters(model),
+    )
+    if cfg.model.use_dat:
+        LOGGER.info("dat_weight=%.3g detach=%s", cfg.model.dat_weight, cfg.model.dat_detach)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
@@ -230,6 +258,22 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--loss", type=str, default=None, choices=["bce", "softmax"])
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="base",
+        choices=["base", "dat"],
+        help="base two-tower, or DAT with augmented vectors",
+    )
+    parser.add_argument(
+        "--dat-weight", type=float, default=None, help="weight of the mimic loss"
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        type=str,
+        default=None,
+        help="where to write report.json / best_model.pt (keep runs separate)",
+    )
     parser.add_argument("--force", action="store_true", help="ignore cached parquet files")
     args = parser.parse_args()
 
@@ -248,6 +292,16 @@ def main() -> None:
         cfg.train.device = args.device
     if args.loss is not None:
         cfg.train.loss_type = args.loss
+    if args.model == "dat":
+        cfg.model.use_dat = True
+    if args.dat_weight is not None:
+        cfg.model.dat_weight = args.dat_weight
+    if args.artifact_dir is not None:
+        cfg.artifact_dir = Path(args.artifact_dir)
+    elif args.model != "base":
+        # Default to a per-model subdir so a DAT run never clobbers the
+        # baseline report we want to compare it against.
+        cfg.artifact_dir = cfg.artifact_dir / args.model
 
     run(cfg, raw_dir=args.raw_dir, force=args.force)
 

@@ -64,6 +64,17 @@ class ModelConfig:
     # Global scalar bias so normalized dot products can calibrate.
     use_global_bias: bool = True
 
+    # --- DAT (Dual Augmented Two-tower, RecSys'21) ---
+    # Each side gets a learnable vector trained to mimic the *other* tower's
+    # output for positive pairs. It is fed into its own tower as a plain input,
+    # so the towers stay independent and item vectors remain precomputable.
+    use_dat: bool = False
+    # Weight of the mimic (augmented) loss added to the main objective.
+    dat_weight: float = 0.1
+    # Stop-gradient on the mimic target. Turning this off lets the towers chase
+    # the augmented vectors back and the pair can collapse; keep it on.
+    dat_detach: bool = True
+
 
 @dataclass
 class TrainConfig:
