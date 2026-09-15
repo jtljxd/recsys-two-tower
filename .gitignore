@@ -10,3 +10,4 @@ artifacts/
 *.npy
 data/processed/
 data/mock/
+data/mock_sparse/

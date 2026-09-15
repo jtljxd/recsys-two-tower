@@ -212,15 +212,57 @@ def _iterative_core_filter(
     df: pd.DataFrame, min_user: int, min_item: int, max_rounds: int = 10
 ) -> pd.DataFrame:
     """Alternate user/item pruning until the frame stops shrinking."""
-    for _ in range(max_rounds):
+    for round_idx in range(max_rounds):
         before = len(df)
         item_counts = df["item_raw"].value_counts()
         df = df[df["item_raw"].map(item_counts) >= min_item]
+        after_items = len(df)
         user_counts = df["user_raw"].value_counts()
         df = df[df["user_raw"].map(user_counts) >= min_user]
+        LOGGER.debug(
+            "core filter round %d: %d -> %d (item prune) -> %d (user prune)",
+            round_idx,
+            before,
+            after_items,
+            len(df),
+        )
         if len(df) == before:
             break
     return df.reset_index(drop=True)
+
+
+def _adaptive_core_filter(
+    df: pd.DataFrame, min_user: int, min_item: int, sampled: bool
+) -> pd.DataFrame:
+    """Core-filter that backs off instead of returning an empty frame.
+
+    The published ``*_5.json.gz`` files are 5-core over *all* users. Once we
+    subsample users that property is gone: most items are left with a single
+    observed interaction, so a strict item threshold deletes everything and the
+    iterative pruning cascades the users away with them.
+
+    So when sampling we try the configured threshold first and fall back to
+    progressively looser item thresholds until something survives.
+    """
+    candidates = [min_item]
+    if sampled:
+        candidates += [c for c in (3, 2, 1) if c < min_item]
+
+    for threshold in candidates:
+        filtered = _iterative_core_filter(df, min_user, threshold)
+        if not filtered.empty:
+            if threshold != min_item:
+                LOGGER.warning(
+                    "min_item_interactions relaxed %d -> %d because user sampling "
+                    "breaks the global 5-core property",
+                    min_item,
+                    threshold,
+                )
+            return filtered
+        LOGGER.warning(
+            "min_item_interactions=%d left no interactions, backing off", threshold
+        )
+    return df.iloc[0:0]
 
 
 def _assign_ids(df: pd.DataFrame) -> pd.DataFrame:
@@ -263,8 +305,11 @@ def run(cfg: Optional[Config] = None, raw_dir: Optional[Path] = None) -> Dict[st
     inter = inter.sort_values(["user_raw", "timestamp"]).drop_duplicates(
         ["user_raw", "item_raw"], keep="first"
     )
-    inter = _iterative_core_filter(
-        inter, cfg.data.min_user_interactions, cfg.data.min_item_interactions
+    inter = _adaptive_core_filter(
+        inter,
+        cfg.data.min_user_interactions,
+        cfg.data.min_item_interactions,
+        sampled=cfg.data.sample_users is not None,
     )
     LOGGER.info(
         "after core filter: %d interactions, %d users, %d items",
@@ -273,7 +318,14 @@ def run(cfg: Optional[Config] = None, raw_dir: Optional[Path] = None) -> Dict[st
         inter["item_raw"].nunique(),
     )
     if inter.empty:
-        raise RuntimeError("no interactions survived filtering; loosen the thresholds")
+        raise RuntimeError(
+            "no interactions survived filtering.\n"
+            "Sampling {} users out of the full set breaks the dataset's global "
+            "5-core property: most items end up with a single observed "
+            "interaction. Either sample more users (--sample-users 50000), use "
+            "the full dataset (--sample-users 0), or lower "
+            "min_item_interactions in config.py.".format(cfg.data.sample_users)
+        )
 
     inter = _assign_ids(inter)
     keep_items = set(inter["item_raw"].unique())
@@ -304,11 +356,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-dir", type=str, default=None)
     parser.add_argument("--sample-users", type=int, default=None)
+    parser.add_argument("--min-item-interactions", type=int, default=None)
     args = parser.parse_args()
 
     cfg = default_config()
     if args.sample_users is not None:
         cfg.data.sample_users = None if args.sample_users <= 0 else args.sample_users
+    if args.min_item_interactions is not None:
+        cfg.data.min_item_interactions = args.min_item_interactions
     run(cfg, raw_dir=args.raw_dir)
 
 

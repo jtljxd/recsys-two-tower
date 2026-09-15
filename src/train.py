@@ -219,6 +219,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-dir", type=str, default=None, help="dir with the .json.gz files")
     parser.add_argument("--sample-users", type=int, default=None, help="<=0 means all users")
+    parser.add_argument(
+        "--min-item-interactions",
+        type=int,
+        default=None,
+        help="item core threshold; lower it when sampling few users",
+    )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
@@ -230,6 +236,8 @@ def main() -> None:
     cfg = default_config()
     if args.sample_users is not None:
         cfg.data.sample_users = None if args.sample_users <= 0 else args.sample_users
+    if args.min_item_interactions is not None:
+        cfg.data.min_item_interactions = args.min_item_interactions
     if args.epochs is not None:
         cfg.train.epochs = args.epochs
     if args.batch_size is not None:
