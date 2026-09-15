@@ -14,6 +14,7 @@ item id for determinism; an event never sees another event that sorts after it.
 """
 
 import math
+import time
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -335,11 +336,25 @@ def build(
 
     acc: Optional[_UserAccumulator] = None
     current_user = None
+    log_every = max(100_000, n // 20)  # ~20 progress lines regardless of size
+    start = time.time()
 
     for idx, row in enumerate(df.itertuples(index=False)):
         if row.user_id != current_user:
             current_user = row.user_id
             acc = _UserAccumulator(max_seq_len)
+
+        if idx and idx % log_every == 0:
+            elapsed = time.time() - start
+            rate = idx / elapsed
+            LOGGER.info(
+                "  features %d/%d (%.1f%%) | %.0f rows/s | eta %.1f min",
+                idx,
+                n,
+                100.0 * idx / n,
+                rate,
+                (n - idx) / rate / 60.0,
+            )
 
         # ---- emit features from the PAST only -----------------------------
         dense[idx] = acc.dense_vector(int(row.timestamp))
