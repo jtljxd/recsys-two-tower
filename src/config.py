@@ -64,6 +64,28 @@ class ModelConfig:
     # Global scalar bias so normalized dot products can calibrate.
     use_global_bias: bool = True
 
+    # --- FIT (Fully Interacted Two-tower, SIGIR'25) ---
+    # MQM gives the user tower an explicit item-side signal without feeding it
+    # the candidate: a learnable meta matrix is matched to the item by softmax,
+    # and the resulting query acts as the DIN target over the behaviour
+    # sequence. LSS replaces the dot product with row/column-wise FC layers on
+    # the multi-head similarity matrix.
+    use_fit: bool = False
+    # Number of item meta vectors (item cluster count). Paper reports 64 in the
+    # main table; 256 scored better but costs more at inference.
+    meta_size: int = 64
+    # Softmax temperature decays 1.0 -> 0.001 over this many steps, so training
+    # starts smooth (many meta vectors updated) and ends argmax-like (matching
+    # the hard-query inference path). Set from steps-per-epoch at runtime.
+    meta_temp_threshold: int = 1000
+    meta_temp_min: float = 0.001
+    # DIN attention MLP over the behaviour sequence, target = soft query.
+    din_hidden: Tuple[int, ...] = (64, 16)
+    # LSS multi-head projections and the similarity-matrix scorer.
+    lss_heads_user: int = 2
+    lss_heads_item: int = 2
+    lss_head_dim: int = 64
+
 
 @dataclass
 class TrainConfig:

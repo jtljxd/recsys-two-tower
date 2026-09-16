@@ -22,7 +22,7 @@ from .data import features as features_mod
 from .data import parse_amazon
 from .data.dataset import build_dataloaders
 from .evaluate import evaluate, format_metrics
-from .model.towers import TwoTowerModel
+from .model.towers import FITModel, TwoTowerModel
 from .utils import (
     count_parameters,
     ensure_dir,
@@ -66,7 +66,8 @@ def prepare_data(cfg: Config, raw_dir: Optional[str], force: bool = False):
 
 def build_model(enc, user_dense_dim: int, cfg: Config) -> TwoTowerModel:
     table = enc.item_table
-    return TwoTowerModel(
+    cls = FITModel if cfg.model.use_fit else TwoTowerModel
+    return cls(
         n_users=enc.n_users,
         n_items=table.n_items - 1,  # table has a padding row at index 0
         n_brands=enc.n_brands,
@@ -119,15 +120,34 @@ def train_one_epoch(
         total_loss += float(loss.item()) * labels.numel()
         total_elements += labels.numel()
 
+        # MQM temperature is a function of the global step, so advance it after
+        # the update rather than before: the loss above used the temperature the
+        # forward pass actually saw.
+        if getattr(model, "mqm", None) is not None:
+            model.mqm.global_step += 1
+
         if cfg.train.log_every and step % cfg.train.log_every == 0:
-            LOGGER.info(
-                "epoch %d step %d/%d loss=%.4f temp=%.3f",
-                epoch,
-                step,
-                len(loader),
-                float(loss.item()),
-                float(model.temperature.item()),
-            )
+            if getattr(model, "mqm", None) is not None:
+                with torch.no_grad():
+                    qs = float(model.query_similarity(batch).mean())
+                LOGGER.info(
+                    "epoch %d step %d/%d loss=%.4f tau=%.4f qs=%.4f",
+                    epoch,
+                    step,
+                    len(loader),
+                    float(loss.item()),
+                    model.mqm.temperature,
+                    qs,
+                )
+            else:
+                LOGGER.info(
+                    "epoch %d step %d/%d loss=%.4f temp=%.3f",
+                    epoch,
+                    step,
+                    len(loader),
+                    float(loss.item()),
+                    float(model.temperature.item()),
+                )
 
     LOGGER.info("epoch %d finished in %.1fs", epoch, time.time() - start)
     return total_loss / max(total_elements, 1)
@@ -142,8 +162,25 @@ def run(cfg: Optional[Config] = None, raw_dir: Optional[str] = None, force: bool
     store, enc = prepare_data(cfg, raw_dir, force)
     train_loader, valid_loader, test_loader = build_dataloaders(store, enc, cfg)
 
+    if cfg.model.use_fit:
+        # Paper sets the annealing horizon to one epoch of steps, so the soft
+        # query has converged onto the hard query by the end of epoch 1.
+        cfg.model.meta_temp_threshold = max(len(train_loader), 1)
+        LOGGER.info(
+            "MQM: meta_size=%d temp_threshold=%d (1 epoch) | LSS: heads=%dx%d dim=%d",
+            cfg.model.meta_size,
+            cfg.model.meta_temp_threshold,
+            cfg.model.lss_heads_user,
+            cfg.model.lss_heads_item,
+            cfg.model.lss_head_dim,
+        )
+
     model = build_model(enc, store.dense.shape[1], cfg).to(device)
-    LOGGER.info("model parameters: %d", count_parameters(model))
+    LOGGER.info(
+        "model: %s | parameters: %d",
+        "fit" if cfg.model.use_fit else "base",
+        count_parameters(model),
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
@@ -230,6 +267,25 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--loss", type=str, default=None, choices=["bce", "softmax"])
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="base",
+        choices=["base", "fit"],
+        help="base two-tower, or FIT with MQM early + LSS late interaction",
+    )
+    parser.add_argument(
+        "--meta-size", type=int, default=None, help="FIT item meta vector count"
+    )
+    parser.add_argument(
+        "--lss-heads", type=int, default=None, help="FIT LSS head count (both sides)"
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        type=str,
+        default=None,
+        help="where to write report.json / best_model.pt (keep runs separate)",
+    )
     parser.add_argument("--force", action="store_true", help="ignore cached parquet files")
     args = parser.parse_args()
 
@@ -248,6 +304,19 @@ def main() -> None:
         cfg.train.device = args.device
     if args.loss is not None:
         cfg.train.loss_type = args.loss
+    if args.model == "fit":
+        cfg.model.use_fit = True
+    if args.meta_size is not None:
+        cfg.model.meta_size = args.meta_size
+    if args.lss_heads is not None:
+        cfg.model.lss_heads_user = args.lss_heads
+        cfg.model.lss_heads_item = args.lss_heads
+    if args.artifact_dir is not None:
+        cfg.artifact_dir = Path(args.artifact_dir)
+    elif args.model != "base":
+        # Per-model subdir so a FIT run never clobbers the baseline report we
+        # want to compare it against.
+        cfg.artifact_dir = cfg.artifact_dir / args.model
 
     run(cfg, raw_dir=args.raw_dir, force=args.force)
 
