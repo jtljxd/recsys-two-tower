@@ -173,6 +173,7 @@ class LightweightSimilarityScorer(nn.Module):
         n_heads_item: int,
         head_dim: int,
         out_dim: int,
+        scale: float = 0.07,
     ):
         super().__init__()
         self.n_heads_user = n_heads_user
@@ -182,9 +183,29 @@ class LightweightSimilarityScorer(nn.Module):
         self.user_proj = nn.Linear(user_dim, n_heads_user * head_dim)
         self.item_proj = nn.Linear(item_dim, n_heads_item * head_dim)
 
+        # The towers emit L2-normalised vectors, so every entry of the similarity
+        # matrix lands in a narrow band around zero (std ~0.09 at init). Feeding
+        # that straight into the FC stack leaves the logits with std ~0.007 --
+        # sigmoid maps the whole batch into [0.39, 0.40] and there is almost no
+        # gradient to learn from. The base model solves the identical problem by
+        # dividing the dot product by a temperature; do the same here, on the
+        # matrix, before the FC layers see it.
+        self.log_scale = nn.Parameter(torch.tensor(math.log(1.0 / scale)))
+
+        # BatchNorm keeps the FC inputs centred, which matters because ReLU
+        # otherwise zeroes the ~50% of entries that are negative.
+        self.row_norm = nn.BatchNorm1d(n_heads_user * n_heads_item)
+
         self.row_fc = nn.Linear(n_heads_item, out_dim)
         self.col_fc = nn.Linear(n_heads_user, out_dim)
         self.out = nn.Linear(out_dim * out_dim, 1)
+
+        # Default init scales weights by 1/sqrt(fan_in); with out_dim^2 inputs
+        # that shrinks the logits back down by roughly the factor the scale above
+        # just bought us. Initialise the projection to unit gain instead, so the
+        # logit spread at step 0 is comparable to the base model's dot/temperature.
+        nn.init.normal_(self.out.weight, std=1.0 / out_dim)
+        nn.init.zeros_(self.out.bias)
 
     def user_heads(self, h_u: torch.Tensor) -> torch.Tensor:
         """(B, d) -> (B, H_u, p)"""
@@ -202,6 +223,12 @@ class LightweightSimilarityScorer(nn.Module):
         """
         # Similarity matrix S: (B, C, H_u, H_v)
         sim = torch.einsum("bcup,bcvp->bcuv", z_u, z_v)
+
+        # Widen the range so the downstream sigmoid can express confidence, then
+        # centre it so ReLU does not discard half the entries.
+        sim = sim * self.log_scale.clamp(max=math.log(1e4)).exp()
+        shape = sim.shape
+        sim = self.row_norm(sim.reshape(-1, shape[-2] * shape[-1])).view(shape)
 
         # Row-wise FC: mixes over item heads.
         s1 = F.relu(self.row_fc(sim))  # (B, C, H_u, out)

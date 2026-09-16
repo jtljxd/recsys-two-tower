@@ -337,6 +337,7 @@ class FITModel(TwoTowerModel):
             n_heads_item=cfg.lss_heads_item,
             head_dim=cfg.lss_head_dim,
             out_dim=cfg.lss_out_dim,
+            scale=cfg.temperature,
         )
 
     def item_attributes(self, item_ids: torch.Tensor) -> torch.Tensor:
