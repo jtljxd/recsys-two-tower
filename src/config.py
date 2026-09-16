@@ -85,6 +85,10 @@ class ModelConfig:
     lss_heads_user: int = 2
     lss_heads_item: int = 2
     lss_head_dim: int = 64
+    # Width of the row/column-wise FC layers. The paper uses the feature
+    # embedding dim (16). Keep this small: the scorer maps only H_u x H_v
+    # numbers, so a wide layer here is pure overfitting surface.
+    lss_out_dim: int = 16
 
 
 @dataclass

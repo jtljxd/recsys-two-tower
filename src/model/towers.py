@@ -336,7 +336,7 @@ class FITModel(TwoTowerModel):
             n_heads_user=cfg.lss_heads_user,
             n_heads_item=cfg.lss_heads_item,
             head_dim=cfg.lss_head_dim,
-            out_dim=d_side,
+            out_dim=cfg.lss_out_dim,
         )
 
     def item_attributes(self, item_ids: torch.Tensor) -> torch.Tensor:
@@ -367,11 +367,18 @@ class FITModel(TwoTowerModel):
         )
         return u.view(b, c, -1)
 
-    def forward(self, batch, hard: bool = False) -> torch.Tensor:
+    def forward(self, batch, hard: Optional[bool] = None) -> torch.Tensor:
         items = batch["items"]  # (B, C)
 
-        # Soft query while training, hard query at inference: the annealed
-        # temperature is what makes these two agree by the end of training.
+        # Soft query while training, hard query at inference -- the annealed
+        # temperature is what makes the two agree by the end of training.
+        #
+        # Defaulting off self.training rather than to a literal matters: the
+        # shared evaluate() calls model(batch) positionally for every model, so
+        # if the default were False the evaluation would silently score with the
+        # soft query and the whole annealing mechanism would be wasted.
+        if hard is None:
+            hard = not self.training
         query, _ = self.mqm(self.item_attributes(items), hard=hard)
 
         u = self.encode_user_per_candidate(batch, query)  # (B, C, D)
