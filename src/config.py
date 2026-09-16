@@ -64,6 +64,11 @@ class ModelConfig:
     # Global scalar bias so normalized dot products can calibrate.
     use_global_bias: bool = True
 
+    # -- InteractRank (Khandagale et al., WWW'25) --------------------------
+    # Replaces the temperature/bias with an affine layer over
+    # [dot product, IQP cross-interaction features].
+    use_interactrank: bool = False
+
 
 @dataclass
 class TrainConfig:

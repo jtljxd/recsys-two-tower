@@ -22,7 +22,7 @@ from .data import features as features_mod
 from .data import parse_amazon
 from .data.dataset import build_dataloaders
 from .evaluate import evaluate, format_metrics
-from .model.towers import TwoTowerModel
+from .model.towers import InteractRankModel, TwoTowerModel
 from .utils import (
     count_parameters,
     ensure_dir,
@@ -66,7 +66,8 @@ def prepare_data(cfg: Config, raw_dir: Optional[str], force: bool = False):
 
 def build_model(enc, user_dense_dim: int, cfg: Config) -> TwoTowerModel:
     table = enc.item_table
-    return TwoTowerModel(
+    cls = InteractRankModel if cfg.model.use_interactrank else TwoTowerModel
+    return cls(
         n_users=enc.n_users,
         n_items=table.n_items - 1,  # table has a padding row at index 0
         n_brands=enc.n_brands,
@@ -143,7 +144,11 @@ def run(cfg: Optional[Config] = None, raw_dir: Optional[str] = None, force: bool
     train_loader, valid_loader, test_loader = build_dataloaders(store, enc, cfg)
 
     model = build_model(enc, store.dense.shape[1], cfg).to(device)
-    LOGGER.info("model parameters: %d", count_parameters(model))
+    LOGGER.info(
+        "model: %s | parameters: %d",
+        "interactrank" if cfg.model.use_interactrank else "base",
+        count_parameters(model),
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
@@ -231,9 +236,23 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--loss", type=str, default=None, choices=["bce", "softmax"])
     parser.add_argument("--force", action="store_true", help="ignore cached parquet files")
+    parser.add_argument(
+        "--model", type=str, default="base", choices=["base", "interactrank"]
+    )
+    parser.add_argument(
+        "--artifact-dir", type=str, default=None,
+        help="where to write report.json / best_model.pt",
+    )
     args = parser.parse_args()
 
     cfg = default_config()
+    cfg.model.use_interactrank = args.model == "interactrank"
+    if args.artifact_dir is not None:
+        cfg.artifact_dir = Path(args.artifact_dir)
+    elif cfg.model.use_interactrank:
+        # Keep each model's report separate by default so comparison runs do
+        # not clobber each other.
+        cfg.artifact_dir = Path(cfg.artifact_dir) / "interactrank"
     if args.sample_users is not None:
         cfg.data.sample_users = None if args.sample_users <= 0 else args.sample_users
     if args.min_item_interactions is not None:

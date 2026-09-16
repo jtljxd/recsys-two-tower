@@ -17,6 +17,7 @@ from ..config import Config, default_config
 from ..utils import get_logger
 from .encoders import Encoders
 from .features import FeatureStore
+from .iqp import IQPLookup, build_iqp_table
 
 LOGGER = get_logger()
 
@@ -116,11 +117,18 @@ class TrainDataset(Dataset):
     """Yields 1 positive + K negatives per row, resampled each epoch."""
 
     def __init__(
-        self, data: SplitData, sampler: NegativeSampler, n_negatives: int
+        self,
+        data: SplitData,
+        sampler: NegativeSampler,
+        n_negatives: int,
+        iqp: Optional[IQPLookup] = None,
+        is_train_split: bool = True,
     ):
         self.data = data
         self.sampler = sampler
         self.n_negatives = n_negatives
+        self.iqp = iqp
+        self.is_train_split = is_train_split
 
     def __len__(self) -> int:
         return len(self.data)
@@ -132,7 +140,7 @@ class TrainDataset(Dataset):
         items = np.concatenate([[d.item_ids[idx]], negatives])
         labels = np.zeros(len(items), dtype=np.float32)
         labels[0] = 1.0
-        return {
+        out = {
             "user_id": torch.tensor(user_id, dtype=torch.long),
             "hist_items": torch.from_numpy(d.hist_items[idx]),
             "hist_len": torch.tensor(d.hist_lens[idx], dtype=torch.long),
@@ -142,16 +150,28 @@ class TrainDataset(Dataset):
             "items": torch.from_numpy(items),
             "labels": torch.from_numpy(labels),
         }
+        if self.iqp is not None:
+            out["iqp"] = torch.from_numpy(
+                self.iqp(items, d.top_cat_ids[idx], d.top_brand_ids[idx],
+                         self.is_train_split)
+            )
+        return out
 
 
 class EvalDataset(Dataset):
     """Frozen candidate sets so every epoch is scored on identical data."""
 
     def __init__(
-        self, data: SplitData, sampler: NegativeSampler, n_negatives: int, seed: int
+        self,
+        data: SplitData,
+        sampler: NegativeSampler,
+        n_negatives: int,
+        seed: int,
+        iqp: Optional[IQPLookup] = None,
     ):
         self.data = data
         self.n_negatives = n_negatives
+        self.iqp = iqp
         rng_state = sampler.rng
         sampler.rng = np.random.default_rng(seed)
         self.candidates = np.stack(
@@ -174,7 +194,7 @@ class EvalDataset(Dataset):
         d = self.data
         labels = np.zeros(self.n_negatives + 1, dtype=np.float32)
         labels[0] = 1.0
-        return {
+        out = {
             "user_id": torch.tensor(int(d.user_ids[idx]), dtype=torch.long),
             "hist_items": torch.from_numpy(d.hist_items[idx]),
             "hist_len": torch.tensor(d.hist_lens[idx], dtype=torch.long),
@@ -184,6 +204,13 @@ class EvalDataset(Dataset):
             "items": torch.from_numpy(self.candidates[idx]),
             "labels": torch.from_numpy(labels),
         }
+        if self.iqp is not None:
+            # valid/test rows never entered the table, so nothing to exclude.
+            out["iqp"] = torch.from_numpy(
+                self.iqp(self.candidates[idx], d.top_cat_ids[idx],
+                         d.top_brand_ids[idx], False)
+            )
+        return out
 
 
 def build_dataloaders(
@@ -198,20 +225,40 @@ def build_dataloaders(
         cfg.data.seed,
     )
 
+    # IQP lookup is only built for InteractRank; the other models never see the
+    # extra batch key and their code paths stay byte-identical.
+    iqp = None
+    if cfg.model.use_interactrank:
+        table = build_iqp_table(
+            store.frame,
+            # item_id -> leaf category id, straight off the encoded item table.
+            {
+                int(i): int(c)
+                for i, c in enumerate(encoders.item_table.cat_leaf_ids)
+            },
+        )
+        iqp = IQPLookup(table, encoders.cat_leaf_vocab, encoders.brand_vocab)
+
     train = TrainDataset(
-        slice_split(store, encoders, "train"), sampler, cfg.data.train_negatives
+        slice_split(store, encoders, "train"),
+        sampler,
+        cfg.data.train_negatives,
+        iqp=iqp,
+        is_train_split=True,
     )
     valid = EvalDataset(
         slice_split(store, encoders, "valid"),
         sampler,
         cfg.data.eval_negatives,
         cfg.data.seed + 1,
+        iqp=iqp,
     )
     test = EvalDataset(
         slice_split(store, encoders, "test"),
         sampler,
         cfg.data.eval_negatives,
         cfg.data.seed + 2,
+        iqp=iqp,
     )
     LOGGER.info(
         "dataset sizes | train=%d valid=%d test=%d", len(train), len(valid), len(test)

@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..config import ModelConfig
+from ..data.iqp import IQP_FEATURES
 
 
 def _mlp(in_dim: int, hidden: Sequence[int], dropout: float) -> nn.Sequential:
@@ -256,3 +257,50 @@ class TwoTowerModel(nn.Module):
         if self.bias is not None:
             logits = logits + self.bias
         return logits
+
+
+class InteractRankModel(TwoTowerModel):
+    """Two tower + IQP cross-interaction features (Khandagale et al., WWW'25).
+
+    The paper's whole contribution to the scoring function is an affine layer
+    over the dot product concatenated with precomputed cross-interaction
+    features:
+
+        score = W . [u.v, IQP_1, ..., IQP_N] + b
+
+    Tower independence is fully preserved -- the IQP values are an offline
+    lookup keyed by (item, context), not a runtime function of the other tower,
+    which is exactly why the paper can claim ~1.1x serving FLOPs against
+    IntTower's 24x.
+
+    The affine layer replaces the base model's temperature and bias, which were
+    doing the same job (scaling and shifting the dot product) with fewer
+    degrees of freedom.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        n_iqp = len(IQP_FEATURES)
+        self.interact = nn.Linear(1 + n_iqp, 1)
+        # Start at the base model's behaviour: dot/temperature passed through,
+        # cross features contributing nothing. The model then learns how much
+        # weight the IQP signals deserve, rather than being perturbed away from
+        # a working solution at step 0.
+        with torch.no_grad():
+            self.interact.weight.zero_()
+            self.interact.weight[0, 0] = 1.0 / float(self.cfg.temperature)
+            self.interact.bias.zero_()
+
+    def forward(self, batch) -> torch.Tensor:
+        u = self.encode_user(batch)
+        v = self.encode_item(batch["items"])
+        dot = torch.einsum("bd,bcd->bc", u, v)
+
+        iqp = batch.get("iqp")
+        if iqp is None:
+            raise KeyError(
+                "InteractRank needs the 'iqp' batch key; build the dataloaders "
+                "with cfg.model.use_interactrank=True"
+            )
+        feats = torch.cat([dot.unsqueeze(-1), iqp], dim=-1)  # (B, C, 1+N)
+        return self.interact(feats).squeeze(-1)

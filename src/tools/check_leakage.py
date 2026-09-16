@@ -93,6 +93,68 @@ def check_split_order(store) -> None:
     LOGGER.info("split chronology OK (%d users)", len(complete))
 
 
+def check_iqp_no_leakage(store) -> None:
+    """IQP counts must not encode anything from valid/test.
+
+    Two independent assertions:
+
+    1. Items that appear *only* after the training cutoff must read as unseen.
+       If a test-period item carried a nonzero popularity prior, the table
+       would be telling the model something it could not know at serving time.
+    2. Removing a training positive's own contribution must actually change
+       its value. If it does not, the self-exclusion is silently broken and the
+       model can read the label off the feature.
+    """
+    from ..data.iqp import build_iqp_table, lookup
+
+    frame = store.frame
+    cat_of = {}
+    table = build_iqp_table(frame, cat_of)
+
+    train_items = set(
+        frame.loc[(frame["split"] == "train") & (frame["label"] > 0), "item_id"]
+        .astype(int)
+    )
+    later_items = set(frame.loc[frame["split"] != "train", "item_id"].astype(int))
+    unseen = sorted(later_items - train_items)
+    if unseen:
+        probe = np.array(unseen[:500], dtype=np.int64)
+        vals = lookup(
+            table,
+            probe,
+            np.full(len(probe), "", dtype=object),
+            np.full(len(probe), "", dtype=object),
+            np.zeros(len(probe), dtype=bool),
+        )
+        hot = float(vals[:, :3].max())
+        if hot != 0.0:
+            raise AssertionError(
+                f"IQP leaks: {len(unseen)} test-only items have nonzero priors "
+                f"(max {hot:.6f}); the table saw data past the training cutoff"
+            )
+        LOGGER.info("IQP unseen-item check OK (%d test-only items, all zero)", len(unseen))
+    else:
+        LOGGER.warning("IQP unseen-item check skipped: no test-only items")
+
+    pos = frame[(frame["split"] == "train") & (frame["label"] > 0)]
+    if len(pos):
+        row = pos.iloc[0]
+        item = np.array([int(row["item_id"])], dtype=np.int64)
+        ctx_c = np.array([row["top_cat"]], dtype=object)
+        ctx_b = np.array([row["top_brand"]], dtype=object)
+        with_self = lookup(table, item, ctx_c, ctx_b, np.array([False]))
+        without = lookup(table, item, ctx_c, ctx_b, np.array([True]))
+        if float(np.abs(with_self - without).max()) == 0.0:
+            raise AssertionError(
+                "IQP self-exclusion is a no-op; a positive's own engagement is "
+                "still inside its feature and the label is readable from it"
+            )
+        LOGGER.info(
+            "IQP self-exclusion OK (delta %.6f)",
+            float(np.abs(with_self - without).max()),
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-dir", type=str, default=None)
@@ -110,6 +172,7 @@ def main() -> None:
     check_history_causality(store, interactions)
     check_dense_recompute(store, interactions)
     check_split_order(store)
+    check_iqp_no_leakage(store)
     LOGGER.info("all leakage checks passed")
 
 
