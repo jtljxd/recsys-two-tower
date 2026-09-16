@@ -64,6 +64,29 @@ DENSE_FEATURES: Tuple[str, ...] = (
 
 
 @dataclass
+class CatProfile:
+    """Per-row snapshot of the user's category/brand history, in CSR form.
+
+    Row i holds the counts accumulated over user u's events *strictly before*
+    row i -- the same causal guarantee the dense features already carry, since
+    both are read off the accumulator before ``update``.
+
+    A dense (n_rows x n_categories) matrix would be far too large, and users
+    touch only a handful of distinct categories each, so this stores the
+    nonzeros only.
+    """
+
+    indptr: np.ndarray  # (N + 1,) int64
+    cat_ids: np.ndarray  # (nnz,) int64 -- raw category strings, encoded later
+    cat_counts: np.ndarray  # (nnz,) int32
+    cat_ratings: np.ndarray  # (nnz,) float32, rating total for that category
+    brand_indptr: np.ndarray  # (N + 1,) int64
+    brand_ids: np.ndarray  # (nnz_b,) int64
+    brand_counts: np.ndarray  # (nnz_b,) int32
+    totals: np.ndarray  # (N,) int32 -- history length, the ratio denominator
+
+
+@dataclass
 class FeatureStore:
     """Everything the Dataset needs, already aligned row-by-row."""
 
@@ -72,6 +95,7 @@ class FeatureStore:
     hist_lens: np.ndarray  # (N,) int64
     dense: np.ndarray  # (N, len(DENSE_FEATURES)) float32
     dense_names: Tuple[str, ...] = DENSE_FEATURES
+    cat_profile: Optional[CatProfile] = None
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -118,6 +142,7 @@ class _UserAccumulator:
         "price_missing",
         "cat_counter",
         "brand_counter",
+        "cat_rating_sum",
         "recent_items",
     )
 
@@ -141,6 +166,9 @@ class _UserAccumulator:
         self.price_missing = 0
         self.cat_counter: Counter = Counter()
         self.brand_counter: Counter = Counter()
+        # Rating total per category, so the cross features can report how well
+        # the user liked a category rather than only how often they touched it.
+        self.cat_rating_sum: Counter = Counter()
         self.recent_items: deque = deque(maxlen=max_seq_len)
 
     # -- read side: only ever called before ``update`` for the same event ----
@@ -259,6 +287,7 @@ class _UserAccumulator:
 
         if category:
             self.cat_counter[category] += 1
+            self.cat_rating_sum[category] += rating
         if brand:
             self.brand_counter[brand] += 1
         self.recent_items.append(item_id)
@@ -334,6 +363,19 @@ def build(
     top_cats: List[str] = [""] * n
     top_brands: List[str] = [""] * n
 
+    # Per-row category/brand history snapshots for the InteractRank cross
+    # features. Collected in the same place as ``dense``, i.e. before the
+    # current event is folded in, so causality is inherited rather than
+    # re-argued.
+    cp_cats: List[str] = []
+    cp_counts: List[int] = []
+    cp_ratings: List[float] = []
+    cp_indptr = np.zeros(n + 1, dtype=np.int64)
+    cp_brands: List[str] = []
+    cp_bcounts: List[int] = []
+    cp_bindptr = np.zeros(n + 1, dtype=np.int64)
+    cp_totals = np.zeros(n, dtype=np.int32)
+
     acc: Optional[_UserAccumulator] = None
     current_user = None
     log_every = max(100_000, n // 20)  # ~20 progress lines regardless of size
@@ -366,6 +408,17 @@ def build(
         top_cats[idx] = acc.top_category()
         top_brands[idx] = acc.top_brand()
 
+        for c, cnt in acc.cat_counter.items():
+            cp_cats.append(c)
+            cp_counts.append(cnt)
+            cp_ratings.append(acc.cat_rating_sum[c])
+        cp_indptr[idx + 1] = len(cp_cats)
+        for b, cnt in acc.brand_counter.items():
+            cp_brands.append(b)
+            cp_bcounts.append(cnt)
+        cp_bindptr[idx + 1] = len(cp_brands)
+        cp_totals[idx] = acc.n
+
         # ---- only now does the current event become history ---------------
         price, cat, brand = lookup.get(int(row.item_id), (float("nan"), "", ""))
         acc.update(
@@ -397,31 +450,70 @@ def build(
         float(frame["label"].mean()),
     )
     return FeatureStore(
-        frame=frame, hist_items=hist_items, hist_lens=hist_lens, dense=dense
+        frame=frame,
+        hist_items=hist_items,
+        hist_lens=hist_lens,
+        dense=dense,
+        cat_profile=CatProfile(
+            indptr=cp_indptr,
+            # Strings for now; encoders map them to ids once the vocab exists.
+            cat_ids=np.array(cp_cats, dtype=object),
+            cat_counts=np.array(cp_counts, dtype=np.int32),
+            cat_ratings=np.array(cp_ratings, dtype=np.float32),
+            brand_indptr=cp_bindptr,
+            brand_ids=np.array(cp_brands, dtype=object),
+            brand_counts=np.array(cp_bcounts, dtype=np.int32),
+            totals=cp_totals,
+        ),
     )
 
 
 def save(store: FeatureStore, out_dir: Path) -> None:
     ensure_dir(out_dir)
     save_table(store.frame, out_dir, "samples")
-    np.savez_compressed(
-        out_dir / "user_features.npz",
+    arrays = dict(
         hist_items=store.hist_items,
         hist_lens=store.hist_lens,
         dense=store.dense,
         dense_names=np.array(store.dense_names),
     )
+    cp = store.cat_profile
+    if cp is not None:
+        arrays.update(
+            cp_indptr=cp.indptr,
+            cp_cat_ids=cp.cat_ids,
+            cp_cat_counts=cp.cat_counts,
+            cp_cat_ratings=cp.cat_ratings,
+            cp_brand_indptr=cp.brand_indptr,
+            cp_brand_ids=cp.brand_ids,
+            cp_brand_counts=cp.brand_counts,
+            cp_totals=cp.totals,
+        )
+    np.savez_compressed(out_dir / "user_features.npz", **arrays)
 
 
 def load(out_dir: Path) -> FeatureStore:
     frame = load_table(out_dir, "samples")
     arrays = np.load(out_dir / "user_features.npz", allow_pickle=True)
+    cp = None
+    if "cp_indptr" in arrays:
+        cp = CatProfile(
+            indptr=arrays["cp_indptr"],
+            cat_ids=arrays["cp_cat_ids"],
+            cat_counts=arrays["cp_cat_counts"],
+            cat_ratings=arrays["cp_cat_ratings"],
+            brand_indptr=arrays["cp_brand_indptr"],
+            brand_ids=arrays["cp_brand_ids"],
+            brand_counts=arrays["cp_brand_counts"],
+            totals=arrays["cp_totals"],
+        )
     return FeatureStore(
         frame=frame,
         hist_items=arrays["hist_items"],
         hist_lens=arrays["hist_lens"],
         dense=arrays["dense"],
         dense_names=tuple(arrays["dense_names"].tolist()),
+        cat_profile=cp,
     )
 
 

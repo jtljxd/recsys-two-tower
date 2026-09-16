@@ -94,65 +94,102 @@ def check_split_order(store) -> None:
 
 
 def check_iqp_no_leakage(store) -> None:
-    """IQP counts must not encode anything from valid/test.
+    """The cross features must not encode the label.
 
-    Two independent assertions:
+    Three assertions, each guarding a distinct failure mode:
 
-    1. Items that appear *only* after the training cutoff must read as unseen.
-       If a test-period item carried a nonzero popularity prior, the table
-       would be telling the model something it could not know at serving time.
-    2. Removing a training positive's own contribution must actually change
-       its value. If it does not, the self-exclusion is silently broken and the
-       model can read the label off the feature.
+    1. Category snapshots are causal: row i's counts must equal the number of
+       the user's events strictly before i.
+    2. Test-period items carry no global prior. With a temporal split, a
+       nonzero value would mean the table saw past the training cutoff.
+    3. The feature distribution overlaps between positives and negatives. This
+       is the important one: if a feature were derived from the user's own
+       interaction with the candidate item, negatives would be identically
+       zero (the sampler skips seen items) and the model could read the label
+       straight off it.
     """
-    from ..data.iqp import build_iqp_table, lookup
+    from ..data.iqp import build_iqp_table
 
     frame = store.frame
-    cat_of = {}
-    table = build_iqp_table(frame, cat_of)
+    cp = store.cat_profile
+    if cp is None:
+        raise AssertionError("cat_profile missing; features must be rebuilt")
 
+    # (1) causality: nnz counts sum to the number of prior events.
+    users = frame["user_id"].to_numpy()
+    seen_n = {}
+    bad = 0
+    for i in range(len(frame)):
+        u = users[i]
+        expected = seen_n.get(u, 0)
+        lo, hi = int(cp.indptr[i]), int(cp.indptr[i + 1])
+        got = int(cp.cat_counts[lo:hi].sum())
+        # Categories can be blank for some items, so the snapshot total is a
+        # lower bound on the event count, never an over-count.
+        if got > expected:
+            bad += 1
+        seen_n[u] = expected + 1
+    if bad:
+        raise AssertionError(
+            f"category snapshot sees the future on {bad} rows"
+        )
+    LOGGER.info("IQP snapshot causality OK (%d rows)", len(frame))
+
+    # (2) no global prior for test-only items.
+    table = build_iqp_table(frame)
     train_items = set(
         frame.loc[(frame["split"] == "train") & (frame["label"] > 0), "item_id"]
         .astype(int)
     )
-    later_items = set(frame.loc[frame["split"] != "train", "item_id"].astype(int))
-    unseen = sorted(later_items - train_items)
+    later = set(frame.loc[frame["split"] != "train", "item_id"].astype(int))
+    unseen = sorted(later - train_items)
     if unseen:
-        probe = np.array(unseen[:500], dtype=np.int64)
-        vals = lookup(
-            table,
-            probe,
-            np.full(len(probe), "", dtype=object),
-            np.full(len(probe), "", dtype=object),
-            np.zeros(len(probe), dtype=bool),
-        )
-        hot = float(vals[:, :3].max())
-        if hot != 0.0:
+        hot = max(table.item_total.get(i, 0) for i in unseen)
+        if hot:
             raise AssertionError(
-                f"IQP leaks: {len(unseen)} test-only items have nonzero priors "
-                f"(max {hot:.6f}); the table saw data past the training cutoff"
+                f"global prior leaks: test-only items carry counts (max {hot})"
             )
-        LOGGER.info("IQP unseen-item check OK (%d test-only items, all zero)", len(unseen))
+        LOGGER.info("IQP unseen-item check OK (%d test-only items)", len(unseen))
     else:
         LOGGER.warning("IQP unseen-item check skipped: no test-only items")
 
-    pos = frame[(frame["split"] == "train") & (frame["label"] > 0)]
-    if len(pos):
-        row = pos.iloc[0]
-        item = np.array([int(row["item_id"])], dtype=np.int64)
-        ctx_c = np.array([row["top_cat"]], dtype=object)
-        ctx_b = np.array([row["top_brand"]], dtype=object)
-        with_self = lookup(table, item, ctx_c, ctx_b, np.array([False]))
-        without = lookup(table, item, ctx_c, ctx_b, np.array([True]))
-        if float(np.abs(with_self - without).max()) == 0.0:
+    # (3) positives and negatives must draw from the same distribution.
+    # This is the assertion that matters most. A feature built from the user's
+    # own interaction with the candidate would be nonzero for every positive
+    # and zero for every negative, because the sampler skips seen items, and
+    # the model would score a meaningless near-perfect AUC off it.
+    from ..config import default_config
+    from ..data import dataset as dataset_mod
+    from ..data import encoders as encoders_mod
+    from ..data.iqp import IQP_FEATURES
+
+    cfg = default_config()
+    cfg.model.use_interactrank = True
+    enc = encoders_mod.load(cfg.processed_dir)
+    train_loader, _, _ = dataset_mod.build_dataloaders(store, enc, cfg)
+    pos, neg = [], []
+    for i, batch in enumerate(train_loader):
+        q = batch["iqp"].numpy()
+        pos.append(q[:, 0, :])
+        neg.append(q[:, 1:, :].reshape(-1, q.shape[-1]))
+        if i >= 12:
+            break
+    pos = np.concatenate(pos)
+    neg = np.concatenate(neg)
+    for j, name in enumerate(IQP_FEATURES):
+        pz = float((pos[:, j] != 0).mean())
+        nz = float((neg[:, j] != 0).mean())
+        if pz > 0.05 and nz < 0.001:
             raise AssertionError(
-                "IQP self-exclusion is a no-op; a positive's own engagement is "
-                "still inside its feature and the label is readable from it"
+                f"{name} is a label indicator: {pz:.1%} of positives nonzero "
+                f"but only {nz:.3%} of negatives. It almost certainly reads the "
+                "user's interaction with the candidate item, which the negative "
+                "sampler excludes by construction."
             )
-        LOGGER.info(
-            "IQP self-exclusion OK (delta %.6f)",
-            float(np.abs(with_self - without).max()),
-        )
+    LOGGER.info(
+        "IQP label-indicator check OK (%d features, pos/neg nonzero rates within range)",
+        len(IQP_FEATURES),
+    )
 
 
 def main() -> None:

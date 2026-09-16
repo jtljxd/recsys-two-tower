@@ -83,6 +83,9 @@ class SplitData:
     dense: np.ndarray
     top_cat_ids: np.ndarray
     top_brand_ids: np.ndarray
+    # Row positions in the *global* feature store. The category snapshots are
+    # keyed that way, so the mapping has to survive the split slicing.
+    global_rows: Optional[np.ndarray] = None
 
     def __len__(self) -> int:
         return len(self.user_ids)
@@ -110,6 +113,7 @@ def slice_split(
         top_brand_ids=encoders.brand_vocab.encode_many(
             frame["top_brand"].to_numpy()[idx]
         ),
+        global_rows=idx,
     )
 
 
@@ -122,13 +126,11 @@ class TrainDataset(Dataset):
         sampler: NegativeSampler,
         n_negatives: int,
         iqp: Optional[IQPLookup] = None,
-        is_train_split: bool = True,
     ):
         self.data = data
         self.sampler = sampler
         self.n_negatives = n_negatives
         self.iqp = iqp
-        self.is_train_split = is_train_split
 
     def __len__(self) -> int:
         return len(self.data)
@@ -152,8 +154,7 @@ class TrainDataset(Dataset):
         }
         if self.iqp is not None:
             out["iqp"] = torch.from_numpy(
-                self.iqp(items, d.top_cat_ids[idx], d.top_brand_ids[idx],
-                         self.is_train_split)
+                self.iqp(int(d.global_rows[idx]), items)
             )
         return out
 
@@ -205,10 +206,8 @@ class EvalDataset(Dataset):
             "labels": torch.from_numpy(labels),
         }
         if self.iqp is not None:
-            # valid/test rows never entered the table, so nothing to exclude.
             out["iqp"] = torch.from_numpy(
-                self.iqp(self.candidates[idx], d.top_cat_ids[idx],
-                         d.top_brand_ids[idx], False)
+                self.iqp(int(d.global_rows[idx]), self.candidates[idx])
             )
         return out
 
@@ -229,22 +228,25 @@ def build_dataloaders(
     # extra batch key and their code paths stay byte-identical.
     iqp = None
     if cfg.model.use_interactrank:
-        table = build_iqp_table(
-            store.frame,
-            # item_id -> leaf category id, straight off the encoded item table.
-            {
-                int(i): int(c)
-                for i, c in enumerate(encoders.item_table.cat_leaf_ids)
-            },
+        if store.cat_profile is None:
+            raise ValueError(
+                "InteractRank needs cat_profile; the cached features predate it, "
+                "rerun with --force"
+            )
+        iqp = IQPLookup(
+            build_iqp_table(store.frame),
+            store.cat_profile,
+            encoders.item_table.cat_leaf_ids,
+            encoders.item_table.brand_ids,
+            encoders.cat_leaf_vocab,
+            encoders.brand_vocab,
         )
-        iqp = IQPLookup(table, encoders.cat_leaf_vocab, encoders.brand_vocab)
 
     train = TrainDataset(
         slice_split(store, encoders, "train"),
         sampler,
         cfg.data.train_negatives,
         iqp=iqp,
-        is_train_split=True,
     )
     valid = EvalDataset(
         slice_split(store, encoders, "valid"),
