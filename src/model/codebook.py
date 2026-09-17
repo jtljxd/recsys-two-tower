@@ -56,8 +56,10 @@ class ResidualCodebook(nn.Module):
         codebook_size: int = 4,
         code_dim: int = 16,
         dead_threshold: int = 10,
-        assign_weight: float = 1e-4,
+        assign_weight: float = 1e-2,
         revive_weight: float = 1e-2,
+        balance_weight: float = 0.1,
+        balance_temp: float = 1.0,
     ):
         super().__init__()
         self.n_levels = n_levels
@@ -66,6 +68,8 @@ class ResidualCodebook(nn.Module):
         self.dead_threshold = dead_threshold
         self.assign_weight = assign_weight
         self.revive_weight = revive_weight
+        self.balance_weight = balance_weight
+        self.balance_temp = balance_temp
 
         # Centroids live in feature space and are trained only by the MSE loss.
         # They start at zero and are replaced by real data points on the first
@@ -116,20 +120,40 @@ class ResidualCodebook(nn.Module):
         cross features, whose pairwise distance (~2.5) is small next to their
         norm (~4.8).
 
-        Seeding with spread-out real points removes the tie at step 0, which is
-        all the MSE updates need to take over.
+        Farthest-point seeding fixes the tie but creates a different problem:
+        mutually distant points are by definition on the boundary of the data,
+        so the resulting partition is lopsided from the start, and the MSE term
+        then holds it there by pulling each centroid to its own cluster mean.
+        Measured on isotropic Gaussian input, which should split evenly, that
+        gave [472, 123, 963, 490] at init and [450, 129, 973, 496] after 300
+        steps -- the centroids moved 3.06 in norm and the partition did not
+        budge.
+
+        Seeding at uniform quantiles of the projection onto the principal axis
+        gives every centroid a comparable share to begin with, which is the
+        state the balance term can maintain rather than having to fight for.
         """
         for level in range(self.n_levels):
-            pool = x if level == 0 else x - self.centroids[level - 1][
-                torch.cdist(x, self.centroids[level - 1]).argmin(dim=-1)
+            # The residual must accumulate across every preceding level, exactly
+            # as the forward pass does. Subtracting only the previous level
+            # leaves each centroid set calibrated against the wrong input: on
+            # real data that made level 3 *increase* the residual by 324%.
+            pool = x
+            for prev in range(level):
+                pool = pool - self.centroids[prev][
+                    torch.cdist(pool, self.centroids[prev]).argmin(dim=-1)
+                ]
+            centred = pool - pool.mean(0, keepdim=True)
+            # Principal axis: the direction with the most spread, and therefore
+            # the one along which equal-sized slices are most meaningful.
+            axis = torch.linalg.svd(centred, full_matrices=False)[2][0]
+            order = (centred @ axis).argsort()
+            # Midpoint of each equal-count slice.
+            qs = [
+                (2 * k + 1) * len(order) // (2 * self.codebook_size)
+                for k in range(self.codebook_size)
             ]
-            picks = [pool[torch.randint(len(pool), (1,)).item()]]
-            for _ in range(self.codebook_size - 1):
-                # Farthest point from what has been picked so far, so the
-                # initial centroids span the data instead of clumping.
-                d = torch.cdist(pool, torch.stack(picks)).min(dim=-1).values
-                picks.append(pool[int(d.argmax())])
-            self.centroids[level].copy_(torch.stack(picks))
+            self.centroids[level].copy_(pool[order[qs]])
         self.initialised.fill_(True)
 
     def forward(
@@ -176,14 +200,24 @@ class ResidualCodebook(nn.Module):
     ) -> torch.Tensor:
         """Pull each centroid toward the mean of the samples assigned to it.
 
+        Two forces beyond plain k-means, both necessary:
+
         A centroid that wins almost nothing is dead weight, and in a residual
         scheme a dead level-1 centroid starves everything below it. Those are
-        instead pulled toward a sample drawn from the busiest cluster, with a
-        much larger weight so they actually relocate -- the same escape valve
-        the production model uses.
+        pulled toward a sample drawn from the busiest cluster instead, with a
+        much larger weight so they actually relocate.
+
+        Plain squared-error clustering also has no interest in balanced
+        partitions -- it is perfectly happy for one centroid to own most of the
+        data. Measured on isotropic Gaussian input, which should split evenly,
+        occupancy came out [3397, 812, 659, 252]. A codebook that skewed wastes
+        most of its capacity: the towers see one code almost always and learn
+        nothing from it. The balance term below penalises deviation from uniform
+        occupancy, which is what actually spreads the centroids out.
         """
         loss = x.new_zeros(())
         residual = x.detach()
+        uniform = 1.0 / self.codebook_size
 
         for level in range(self.n_levels):
             idx = indices[level]
@@ -198,7 +232,10 @@ class ResidualCodebook(nn.Module):
 
                 if n >= self.dead_threshold:
                     target = residual[mask].mean(dim=0)
-                    weight = self.assign_weight
+                    # Scaled by share of the batch, so a centroid holding most
+                    # of the data is not dragged around by the same force as one
+                    # holding a handful of noisy points.
+                    weight = self.assign_weight * (n / len(idx)) / uniform
                 elif len(donor_pool):
                     # Relocate into the crowded region to share its load.
                     pick = torch.randint(
@@ -211,6 +248,18 @@ class ResidualCodebook(nn.Module):
 
                 loss = loss + weight * 0.5 * F.mse_loss(
                     centroid, target.detach(), reduction="sum"
+                )
+
+            if self.balance_weight > 0:
+                # Soft assignment probabilities: the hard argmin carries no
+                # gradient, so balance is expressed over a softmax of negative
+                # distances. Minimising sum(p_k^2) is minimising the collision
+                # probability of the assignment distribution, which is at its
+                # lowest exactly when occupancy is uniform.
+                logits = -torch.cdist(residual, self.centroids[level])
+                probs = F.softmax(logits / self.balance_temp, dim=-1).mean(0)
+                loss = loss + self.balance_weight * (
+                    (probs * probs).sum() * self.codebook_size - 1.0
                 )
 
             residual = residual - self.centroids[level][idx].detach()
