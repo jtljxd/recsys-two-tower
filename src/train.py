@@ -22,7 +22,7 @@ from .data import features as features_mod
 from .data import parse_amazon
 from .data.dataset import build_dataloaders
 from .evaluate import evaluate, format_metrics
-from .model.towers import InteractRankModel, TwoTowerModel
+from .model.towers import InteractRankModel, OursModel, TwoTowerModel
 from .utils import (
     count_parameters,
     ensure_dir,
@@ -66,7 +66,11 @@ def prepare_data(cfg: Config, raw_dir: Optional[str], force: bool = False):
 
 def build_model(enc, user_dense_dim: int, cfg: Config) -> TwoTowerModel:
     table = enc.item_table
-    cls = InteractRankModel if cfg.model.use_interactrank else TwoTowerModel
+    cls = TwoTowerModel
+    if cfg.model.use_codebook:
+        cls = OursModel
+    elif cfg.model.use_interactrank:
+        cls = InteractRankModel
     return cls(
         n_users=enc.n_users,
         n_items=table.n_items - 1,  # table has a padding row at index 0
@@ -111,24 +115,48 @@ def train_one_epoch(
         else:
             raise ValueError("unknown loss_type: {}".format(cfg.train.loss_type))
 
+        # Reported separately so train_loss stays comparable to the other
+        # models regardless of how the codebook term is weighted.
+        main_loss = float(loss.item())
+        cb_loss = None
+        if getattr(model, "codebook", None) is not None:
+            cb = model.codebook_loss()
+            cb_loss = float(cb.item())
+            loss = loss + cfg.model.code_loss_weight * cb
+
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if cfg.train.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
         optimizer.step()
 
-        total_loss += float(loss.item()) * labels.numel()
+        total_loss += main_loss * labels.numel()
         total_elements += labels.numel()
 
         if cfg.train.log_every and step % cfg.train.log_every == 0:
-            LOGGER.info(
-                "epoch %d step %d/%d loss=%.4f temp=%.3f",
-                epoch,
-                step,
-                len(loader),
-                float(loss.item()),
-                float(model.temperature.item()),
-            )
+            if cb_loss is not None:
+                # Occupancy is the diagnostic that matters: if a level collapses
+                # onto one or two centroids the codebook is oversized and its
+                # capacity is wasted.
+                occ = model.codebook.occupancy()
+                LOGGER.info(
+                    "epoch %d step %d/%d loss=%.4f cb=%.6f occ=%s",
+                    epoch,
+                    step,
+                    len(loader),
+                    main_loss,
+                    cb_loss,
+                    " ".join(str(lv) for lv in occ),
+                )
+            else:
+                LOGGER.info(
+                    "epoch %d step %d/%d loss=%.4f temp=%.3f",
+                    epoch,
+                    step,
+                    len(loader),
+                    main_loss,
+                    float(model.temperature.item()),
+                )
 
     LOGGER.info("epoch %d finished in %.1fs", epoch, time.time() - start)
     return total_loss / max(total_elements, 1)
@@ -146,7 +174,8 @@ def run(cfg: Optional[Config] = None, raw_dir: Optional[str] = None, force: bool
     model = build_model(enc, store.dense.shape[1], cfg).to(device)
     LOGGER.info(
         "model: %s | parameters: %d",
-        "interactrank" if cfg.model.use_interactrank else "base",
+        "ours" if cfg.model.use_codebook
+        else ("interactrank" if cfg.model.use_interactrank else "base"),
         count_parameters(model),
     )
 
@@ -237,7 +266,8 @@ def main() -> None:
     parser.add_argument("--loss", type=str, default=None, choices=["bce", "softmax"])
     parser.add_argument("--force", action="store_true", help="ignore cached parquet files")
     parser.add_argument(
-        "--model", type=str, default="base", choices=["base", "interactrank"]
+        "--model", type=str, default="base",
+        choices=["base", "interactrank", "ours"],
     )
     parser.add_argument(
         "--artifact-dir", type=str, default=None,
@@ -246,13 +276,15 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = default_config()
-    cfg.model.use_interactrank = args.model == "interactrank"
+    cfg.model.use_codebook = args.model == "ours"
+    # Ours builds on InteractRank, so it needs the same cross features.
+    cfg.model.use_interactrank = args.model in ("interactrank", "ours")
     if args.artifact_dir is not None:
         cfg.artifact_dir = Path(args.artifact_dir)
     elif cfg.model.use_interactrank:
         # Keep each model's report separate by default so comparison runs do
         # not clobber each other.
-        cfg.artifact_dir = Path(cfg.artifact_dir) / "interactrank"
+        cfg.artifact_dir = Path(cfg.artifact_dir) / args.model
     if args.sample_users is not None:
         cfg.data.sample_users = None if args.sample_users <= 0 else args.sample_users
     if args.min_item_interactions is not None:

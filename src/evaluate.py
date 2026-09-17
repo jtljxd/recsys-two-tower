@@ -102,6 +102,7 @@ def evaluate(
     all_scores: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
     all_users: List[np.ndarray] = []
+    all_hist: List[np.ndarray] = []
     loss_sum = 0.0
     n_elements = 0
 
@@ -118,6 +119,7 @@ def evaluate(
         all_users.append(
             batch["user_id"].detach().cpu().numpy().repeat(labels.shape[1])
         )
+        all_hist.append(batch["hist_len"].detach().cpu().numpy())
 
     scores = np.concatenate(all_scores)
     labels = np.concatenate(all_labels)
@@ -141,11 +143,25 @@ def evaluate(
         )
     )
     metrics.update(ranking_metrics(scores, ks))
+
+    # Cold-start slices. A codebook is shared across all rows, so a user with
+    # almost no history can still land in a populated cluster; a per-ID
+    # augmentation vector has nothing to offer them. If the codebook helps
+    # anywhere it should show up here first, and a flat overall AUC hiding a
+    # real cold-start gain would be worth knowing about.
+    hist = np.concatenate(all_hist)
+    for name, lo, hi in (("cold", 0, 5), ("warm", 5, 20), ("hot", 20, 1 << 30)):
+        sel = (hist >= lo) & (hist < hi)
+        if sel.sum() < 20:
+            continue
+        rows = np.repeat(sel, labels.shape[1])
+        metrics["auc_" + name] = roc_auc(flat_labels[rows], flat_scores[rows])
+        metrics["n_" + name] = float(sel.sum())
     return metrics
 
 
 def format_metrics(metrics: Dict[str, float], prefix: str = "") -> str:
-    keys = ["loss", "auc", "gauc", "logloss", "mrr"]
+    keys = ["loss", "auc", "gauc", "logloss", "mrr", "auc_cold", "auc_warm", "auc_hot"]
     keys += [k for k in sorted(metrics) if k not in keys]
     parts = [
         "{}={:.4f}".format(k, metrics[k]) for k in keys if k in metrics

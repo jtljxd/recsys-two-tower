@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from ..config import ModelConfig
 from ..data.iqp import IQP_FEATURES
+from .codebook import ResidualCodebook
 
 
 def _mlp(in_dim: int, hidden: Sequence[int], dropout: float) -> nn.Sequential:
@@ -78,6 +79,8 @@ class UserTower(nn.Module):
         self.dense_encoder = DenseEncoder(dense_dim, cfg.dense_hidden, cfg.dropout)
 
         in_dim = d_id * 2 + d_side * 2 + cfg.dense_hidden
+        if cfg.use_codebook:
+            in_dim += cfg.n_code_levels * cfg.code_dim
         self.mlp = _mlp(in_dim, cfg.tower_hidden, cfg.dropout)
         self.normalize = cfg.normalize
         self._init_weights()
@@ -101,6 +104,7 @@ class UserTower(nn.Module):
         dense: torch.Tensor,
         top_cat: torch.Tensor,
         top_brand: torch.Tensor,
+        code: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Masked mean-pooling over the behaviour sequence.
         mask = (hist_items != 0).float().unsqueeze(-1)  # (B, L, 1)
@@ -115,6 +119,8 @@ class UserTower(nn.Module):
             self.top_brand_emb(top_brand),
             self.dense_encoder(dense),
         ]
+        if code is not None:
+            parts.append(code)
         out = self.mlp(torch.cat(parts, dim=-1))
         return F.normalize(out, p=2, dim=-1) if self.normalize else out
 
@@ -140,6 +146,8 @@ class ItemTower(nn.Module):
         self.dense_encoder = DenseEncoder(dense_dim, cfg.dense_hidden, cfg.dropout)
 
         in_dim = d_id + d_side * 3 + cfg.dense_hidden
+        if cfg.use_codebook:
+            in_dim += cfg.n_code_levels * cfg.code_dim
         self.mlp = _mlp(in_dim, cfg.tower_hidden, cfg.dropout)
         self.normalize = cfg.normalize
         self._init_weights()
@@ -157,6 +165,7 @@ class ItemTower(nn.Module):
         cat_l1: torch.Tensor,
         cat_leaf: torch.Tensor,
         dense: torch.Tensor,
+        code: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         parts = [
             self.item_emb(item_id),
@@ -165,6 +174,8 @@ class ItemTower(nn.Module):
             self.cat_leaf_emb(cat_leaf),
             self.dense_encoder(dense),
         ]
+        if code is not None:
+            parts.append(code)
         out = self.mlp(torch.cat(parts, dim=-1))
         return F.normalize(out, p=2, dim=-1) if self.normalize else out
 
@@ -304,3 +315,85 @@ class InteractRankModel(TwoTowerModel):
             )
         feats = torch.cat([dot.unsqueeze(-1), iqp], dim=-1)  # (B, C, 1+N)
         return self.interact(feats).squeeze(-1)
+
+
+class OursModel(InteractRankModel):
+    """InteractRank plus a residual codebook synchronising the two towers.
+
+    The affine layer over [dot product, cross features] is inherited unchanged,
+    so anything this model gains over InteractRank is attributable to the
+    codebook alone.
+
+    The cross features are lifted to a wider space before quantisation. Five
+    scalars, three of which are strongly correlated, do not carry enough
+    structure for a 64-way partition to latch onto; the projection gives the
+    centroids room to separate patterns.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        cfg = self.cfg
+        n_cross = len(IQP_FEATURES)
+        self.code_proj = nn.Sequential(
+            nn.Linear(n_cross, cfg.code_proj_dim),
+            nn.ReLU(),
+        )
+        self.codebook = ResidualCodebook(
+            in_dim=cfg.code_proj_dim,
+            n_levels=cfg.n_code_levels,
+            codebook_size=cfg.codebook_size,
+            code_dim=cfg.code_dim,
+            dead_threshold=cfg.code_dead_threshold,
+        )
+        self._last_indices = None
+        self._last_proj = None
+
+    def forward(self, batch) -> torch.Tensor:
+        iqp = batch.get("iqp")
+        if iqp is None:
+            raise KeyError(
+                "OursModel needs the 'iqp' batch key; build the dataloaders "
+                "with cfg.model.use_interactrank=True"
+            )
+        items = batch["items"]
+        B, C = items.shape
+
+        # One code per (row, candidate): the crossing varies with the candidate,
+        # so a single code per row would throw away exactly the signal we want.
+        proj = self.code_proj(iqp.reshape(B * C, -1))
+        u_code, v_code, indices = self.codebook(proj)
+        # Stashed for the training loop, which needs them for the codebook loss
+        # and the occupancy log.
+        self._last_proj = proj
+        self._last_indices = indices
+
+        u = self.user_tower(
+            # The user side is constant across candidates but its code is not,
+            # so the row features are repeated to match.
+            batch["user_id"].repeat_interleave(C),
+            batch["hist_items"].repeat_interleave(C, dim=0),
+            batch["hist_len"].repeat_interleave(C),
+            batch["dense"].repeat_interleave(C, dim=0),
+            batch["top_cat"].repeat_interleave(C),
+            batch["top_brand"].repeat_interleave(C),
+            code=u_code,
+        ).view(B, C, -1)
+
+        flat = items.reshape(-1)
+        v = self.item_tower(
+            flat,
+            self.item_brand[flat],
+            self.item_cat_l1[flat],
+            self.item_cat_leaf[flat],
+            self.item_dense[flat],
+            code=v_code,
+        ).view(B, C, -1)
+
+        dot = torch.einsum("bcd,bcd->bc", u, v)
+        feats = torch.cat([dot.unsqueeze(-1), iqp], dim=-1)
+        return self.interact(feats).squeeze(-1)
+
+    def codebook_loss(self) -> torch.Tensor:
+        if self._last_indices is None:
+            return torch.zeros((), device=self.item_dense.device)
+        return self.codebook.codebook_loss(self._last_proj, self._last_indices)
