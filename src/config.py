@@ -82,6 +82,9 @@ class ModelConfig:
     # into the busiest cluster rather than tracking its own empty mean.
     code_dead_threshold: int = 10
     code_loss_weight: float = 1.0
+    # Initial scale of the code block relative to the other tower inputs.
+    # Learnable, so this only sets the starting point.
+    code_gain: float = 0.3
 
 
 @dataclass

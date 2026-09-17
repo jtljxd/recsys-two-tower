@@ -60,6 +60,7 @@ class ResidualCodebook(nn.Module):
         revive_weight: float = 1e-2,
         balance_weight: float = 0.1,
         balance_temp: float = 1.0,
+        code_gain: float = 0.3,
     ):
         super().__init__()
         self.n_levels = n_levels
@@ -93,6 +94,22 @@ class ResidualCodebook(nn.Module):
         )
         for table in list(self.user_codes) + list(self.item_codes):
             nn.init.normal_(table.weight, std=0.01)
+
+        # The towers concatenate this output next to blocks that have been
+        # BatchNorm'd to unit scale. At std=0.01 the code contributed 0.01% of
+        # the input energy -- measured against a dense block with norm 5.58 --
+        # so the towers could not act on it whatever it encoded. Normalising
+        # puts the code on comparable footing and lets the network decide how
+        # much of it to use, rather than having the decision made by an
+        # initialisation constant.
+        self.user_norm = nn.LayerNorm(n_levels * code_dim)
+        self.item_norm = nn.LayerNorm(n_levels * code_dim)
+        # Normalising alone overshoots: the code then accounts for 58% of the
+        # tower's input energy and swamps the ID and behaviour features. The
+        # gain starts small enough to perturb rather than dominate, and is
+        # learnable so the towers can raise it if the code earns the room.
+        self.user_gain = nn.Parameter(torch.tensor(code_gain))
+        self.item_gain = nn.Parameter(torch.tensor(code_gain))
 
         # Diagnostics only; never read by the forward pass.
         self.register_buffer(
@@ -193,7 +210,11 @@ class ResidualCodebook(nn.Module):
                     idx, minlength=self.codebook_size
                 ).float()
 
-        return torch.cat(u_parts, dim=-1), torch.cat(v_parts, dim=-1), indices
+        return (
+            self.user_norm(torch.cat(u_parts, dim=-1)) * self.user_gain,
+            self.item_norm(torch.cat(v_parts, dim=-1)) * self.item_gain,
+            indices,
+        )
 
     def codebook_loss(
         self, x: torch.Tensor, indices: List[torch.Tensor]

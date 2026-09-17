@@ -344,6 +344,7 @@ class OursModel(InteractRankModel):
             codebook_size=cfg.codebook_size,
             code_dim=cfg.code_dim,
             dead_threshold=cfg.code_dead_threshold,
+            code_gain=cfg.code_gain,
         )
         self._last_indices = None
         self._last_proj = None
