@@ -79,9 +79,24 @@ class UserTower(nn.Module):
         self.dense_encoder = DenseEncoder(dense_dim, cfg.dense_hidden, cfg.dropout)
 
         in_dim = d_id * 2 + d_side * 2 + cfg.dense_hidden
-        if cfg.use_codebook:
-            in_dim += cfg.n_code_levels * cfg.code_dim
         self.mlp = _mlp(in_dim, cfg.tower_hidden, cfg.dropout)
+        # The code is injected after the MLP rather than concatenated onto its
+        # input. Concatenating forces the whole tower to run one row per
+        # (user, candidate) pair, and the dropout inside it then draws a fresh
+        # mask for each -- so one user's positive and negatives get different
+        # user vectors. Projecting the code onto the output instead lets the
+        # shared part keep a single dropout draw per user.
+        self.code_fc = (
+            nn.Linear(cfg.n_code_levels * cfg.code_dim, cfg.tower_hidden[-1])
+            if cfg.use_codebook
+            else None
+        )
+        if self.code_fc is not None:
+            # Default init makes this branch 1.7x the trunk's norm, which drowns
+            # the tower. Start it as a small perturbation and let the gain in
+            # ResidualCodebook grow it if the code earns the room.
+            nn.init.normal_(self.code_fc.weight, std=0.01)
+            nn.init.zeros_(self.code_fc.bias)
         self.normalize = cfg.normalize
         self._init_weights()
 
@@ -105,7 +120,24 @@ class UserTower(nn.Module):
         top_cat: torch.Tensor,
         top_brand: torch.Tensor,
         code: Optional[torch.Tensor] = None,
+        expand: int = 1,
     ) -> torch.Tensor:
+        """expand > 1 repeats each row that many times *after* the
+        candidate-independent features are computed.
+
+        The code varies per candidate, so the tower has to emit one row per
+        (user, candidate) pair. Feeding it a pre-expanded batch instead is not
+        equivalent: dropout samples a fresh mask per row, so the same user ends
+        up with a different vector for their positive than for each negative.
+        Measured spread across the 5 copies of one user was 0.5265, against
+        components of order 0.1 in the L2-normalised output. BCE compares one
+        user's scores across candidates, so that noise lands directly on the
+        quantity being ranked -- which is why AUC suffered while logloss did
+        not.
+
+        Computing the shared part once and expanding afterwards keeps a single
+        dropout draw per user, exactly as the non-codebook models see.
+        """
         # Masked mean-pooling over the behaviour sequence.
         mask = (hist_items != 0).float().unsqueeze(-1)  # (B, L, 1)
         seq = self.hist_item_emb(hist_items) * mask
@@ -119,9 +151,11 @@ class UserTower(nn.Module):
             self.top_brand_emb(top_brand),
             self.dense_encoder(dense),
         ]
-        if code is not None:
-            parts.append(code)
         out = self.mlp(torch.cat(parts, dim=-1))
+        if expand > 1:
+            out = out.repeat_interleave(expand, dim=0)
+        if code is not None:
+            out = out + self.code_fc(code)
         return F.normalize(out, p=2, dim=-1) if self.normalize else out
 
 
@@ -146,9 +180,19 @@ class ItemTower(nn.Module):
         self.dense_encoder = DenseEncoder(dense_dim, cfg.dense_hidden, cfg.dropout)
 
         in_dim = d_id + d_side * 3 + cfg.dense_hidden
-        if cfg.use_codebook:
-            in_dim += cfg.n_code_levels * cfg.code_dim
         self.mlp = _mlp(in_dim, cfg.tower_hidden, cfg.dropout)
+        # Symmetric with the user side; see UserTower.
+        self.code_fc = (
+            nn.Linear(cfg.n_code_levels * cfg.code_dim, cfg.tower_hidden[-1])
+            if cfg.use_codebook
+            else None
+        )
+        if self.code_fc is not None:
+            # Default init makes this branch 1.7x the trunk's norm, which drowns
+            # the tower. Start it as a small perturbation and let the gain in
+            # ResidualCodebook grow it if the code earns the room.
+            nn.init.normal_(self.code_fc.weight, std=0.01)
+            nn.init.zeros_(self.code_fc.bias)
         self.normalize = cfg.normalize
         self._init_weights()
 
@@ -174,9 +218,9 @@ class ItemTower(nn.Module):
             self.cat_leaf_emb(cat_leaf),
             self.dense_encoder(dense),
         ]
-        if code is not None:
-            parts.append(code)
         out = self.mlp(torch.cat(parts, dim=-1))
+        if code is not None:
+            out = out + self.code_fc(code)
         return F.normalize(out, p=2, dim=-1) if self.normalize else out
 
 
@@ -369,15 +413,14 @@ class OursModel(InteractRankModel):
         self._last_indices = indices
 
         u = self.user_tower(
-            # The user side is constant across candidates but its code is not,
-            # so the row features are repeated to match.
-            batch["user_id"].repeat_interleave(C),
-            batch["hist_items"].repeat_interleave(C, dim=0),
-            batch["hist_len"].repeat_interleave(C),
-            batch["dense"].repeat_interleave(C, dim=0),
-            batch["top_cat"].repeat_interleave(C),
-            batch["top_brand"].repeat_interleave(C),
+            batch["user_id"],
+            batch["hist_items"],
+            batch["hist_len"],
+            batch["dense"],
+            batch["top_cat"],
+            batch["top_brand"],
             code=u_code,
+            expand=C,
         ).view(B, C, -1)
 
         flat = items.reshape(-1)
