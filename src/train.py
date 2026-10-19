@@ -16,10 +16,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .config import Config, default_config
+from .config import processed_dir_for, Config, default_config
 from .data import encoders as encoders_mod
 from .data import features as features_mod
 from .data import parse_amazon
+from .data import parse_ml1m
 from .data.dataset import build_dataloaders
 from .evaluate import evaluate, format_metrics
 from .model.towers import InteractRankModel, OursModel, TwoTowerModel
@@ -38,12 +39,21 @@ from .utils import (
 LOGGER = get_logger()
 
 
+def _parser_for(cfg: Config):
+    """Dataset -> parser module. Every parser emits the same parquet schemas."""
+    if cfg.data.dataset == "amazon-electronics":
+        return parse_amazon
+    if cfg.data.dataset == "ml-1m":
+        return parse_ml1m
+    raise ValueError("unknown dataset: {}".format(cfg.data.dataset))
+
+
 def prepare_data(cfg: Config, raw_dir: Optional[str], force: bool = False):
     """Parse -> features -> encoders, reusing cached artifacts when possible."""
     processed = cfg.processed_dir
 
     if force or not table_exists(processed, "interactions"):
-        parse_amazon.run(cfg, raw_dir=Path(raw_dir) if raw_dir else None)
+        _parser_for(cfg).run(cfg, raw_dir=Path(raw_dir) if raw_dir else None)
     else:
         LOGGER.info("reusing cached interactions table in %s", processed)
 
@@ -252,6 +262,11 @@ def run(cfg: Optional[Config] = None, raw_dir: Optional[str] = None, force: bool
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-dir", type=str, default=None, help="dir with the .json.gz files")
+    parser.add_argument(
+        "--dataset", type=str, default="amazon-electronics",
+        choices=["amazon-electronics", "ml-1m"],
+        help="which public dataset to run; switches the parser and cache dir",
+    )
     parser.add_argument("--sample-users", type=int, default=None, help="<=0 means all users")
     parser.add_argument(
         "--min-item-interactions",
@@ -276,6 +291,10 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = default_config()
+    cfg.data.dataset = args.dataset
+    # Per-dataset cache: processed-ml-1m instead of processed, so switching
+    # datasets never invalidates or clobbers the other's features.
+    cfg.processed_dir = processed_dir_for(args.dataset)
     cfg.model.use_codebook = args.model == "ours"
     # Ours builds on InteractRank, so it needs the same cross features.
     cfg.model.use_interactrank = args.model in ("interactrank", "ours")

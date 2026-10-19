@@ -11,6 +11,13 @@ PROCESSED_DIR = DATA_DIR / "processed"
 ARTIFACT_DIR = PROJECT_ROOT / "artifacts"
 
 
+def processed_dir_for(dataset: str) -> Path:
+    """Per-dataset cache directory so datasets never clobber each other."""
+    if dataset == "amazon-electronics":
+        return PROCESSED_DIR
+    return DATA_DIR / "processed_{}".format(dataset)
+
+
 @dataclass
 class DataConfig:
     """Controls raw parsing, sampling and train/valid/test split."""
