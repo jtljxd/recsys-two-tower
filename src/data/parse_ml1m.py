@@ -22,6 +22,7 @@ The output schemas (column names, dtypes) are identical to parse_amazon's, so
 """
 
 import argparse
+import re
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -33,6 +34,8 @@ from ..utils import ensure_dir, get_logger, save_table, set_seed, timed
 from .parse_amazon import _adaptive_core_filter, _assign_ids
 
 LOGGER = get_logger()
+
+_YEAR_RE = re.compile(r"\((\d{4})\)")
 
 
 def _load_ratings(path: Path) -> pd.DataFrame:
@@ -71,7 +74,13 @@ def _load_ratings(path: Path) -> pd.DataFrame:
 
 
 def _load_movies(path: Path) -> pd.DataFrame:
-    """MovieID::Title::Genres -> items frame (no brand, no price)."""
+    """MovieID::Title::Genres -> items frame (no brand, no price).
+
+    ``genres`` keeps *all* genres of a movie (not just the first) so the cross
+    features can match a candidate against the user's history on any of its
+    genres; MovieLens has only ~18 genres, so throwing all but one away wastes
+    most of the signal. ``year`` is parsed from the title's trailing (YYYY).
+    """
     rows = []
     with path.open("rt", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -84,13 +93,18 @@ def _load_movies(path: Path) -> pd.DataFrame:
             mid = parts[0].strip()
             title = parts[1].strip()
             genres = parts[2].strip() if len(parts) > 2 else ""
-            first_genre = genres.split("|")[0] if genres else ""
+            genre_list = [g for g in genres.split("|") if g]
+            first_genre = genre_list[0] if genre_list else ""
+            m = _YEAR_RE.search(title)
+            year = float(m.group(1)) if m else np.nan
             rows.append(
                 (
                     mid,
                     "",
                     first_genre,
                     first_genre,  # genres are flat; l1 == leaf here
+                    genre_list,
+                    year,
                     np.nan,       # price
                     np.nan,       # sales_rank
                     len(title.split()),
@@ -105,6 +119,8 @@ def _load_movies(path: Path) -> pd.DataFrame:
             "brand",
             "cat_l1",
             "cat_leaf",
+            "genres",
+            "year",
             "price",
             "sales_rank",
             "title_len",

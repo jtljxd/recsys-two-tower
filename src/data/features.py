@@ -84,6 +84,8 @@ class CatProfile:
     brand_ids: np.ndarray  # (nnz_b,) int64
     brand_counts: np.ndarray  # (nnz_b,) int32
     totals: np.ndarray  # (N,) int32 -- history length, the ratio denominator
+    year_sum: np.ndarray  # (N,) float32 -- sum of watched-item release years
+    year_n: np.ndarray  # (N,) int32 -- count of watched items with a year
 
 
 @dataclass
@@ -143,6 +145,8 @@ class _UserAccumulator:
         "cat_counter",
         "brand_counter",
         "cat_rating_sum",
+        "year_sum",
+        "year_n",
         "recent_items",
     )
 
@@ -169,6 +173,10 @@ class _UserAccumulator:
         # Rating total per category, so the cross features can report how well
         # the user liked a category rather than only how often they touched it.
         self.cat_rating_sum: Counter = Counter()
+        # Release-year statistics over watched items, for the year-difference
+        # cross feature (does the user prefer newer or older content).
+        self.year_sum = 0.0
+        self.year_n = 0
         self.recent_items: deque = deque(maxlen=max_seq_len)
 
     # -- read side: only ever called before ``update`` for the same event ----
@@ -257,7 +265,9 @@ class _UserAccumulator:
         helpful: float,
         price: float,
         category: str,
+        categories: list,
         brand: str,
+        year: float,
         positive_threshold: float,
     ) -> None:
         self.n += 1
@@ -285,11 +295,19 @@ class _UserAccumulator:
         else:
             self.price_missing += 1
 
-        if category:
-            self.cat_counter[category] += 1
-            self.cat_rating_sum[category] += rating
+        # Multi-label categories: a MovieLens movie belongs to several genres
+        # and its behaviour should count toward each, so the cross features can
+        # match the candidate on any of its genres. Amazon passes a single
+        # category, which falls back to the plain (category,) behaviour.
+        cats = list(categories) if categories else ([category] if category else [])
+        for c in cats:
+            self.cat_counter[c] += 1
+            self.cat_rating_sum[c] += rating
         if brand:
             self.brand_counter[brand] += 1
+        if year is not None and not (isinstance(year, float) and math.isnan(year)):
+            self.year_sum += year
+            self.year_n += 1
         self.recent_items.append(item_id)
 
     # -- helpers ------------------------------------------------------------
@@ -316,15 +334,27 @@ class _UserAccumulator:
         )
 
 
-def _item_lookup(items: pd.DataFrame) -> Dict[int, Tuple[float, str, str]]:
-    """item_id -> (price, cat_leaf, brand) for history aggregation."""
+def _item_lookup(items: pd.DataFrame) -> Dict[int, Tuple[float, str, str, list, float]]:
+    """item_id -> (price, cat_leaf, brand, genres, year) for history aggregation.
+
+    genres/year only exist on datasets that carry them (MovieLens); Amazon
+    records fall back to ((), NaN) so behaviour is unchanged.
+    """
     lookup = {}
     for row in items.itertuples(index=False):
         price = getattr(row, "price", np.nan)
+        genres = list(getattr(row, "genres", ()) or ())
+        year = getattr(row, "year", np.nan)
+        try:
+            year = float(year)
+        except (TypeError, ValueError):
+            year = float("nan")
         lookup[int(row.item_id)] = (
             float(price) if price is not None and not pd.isna(price) else float("nan"),
             str(getattr(row, "cat_leaf", "") or ""),
             str(getattr(row, "brand", "") or ""),
+            genres,
+            year,
         )
     return lookup
 
@@ -375,6 +405,8 @@ def build(
     cp_bcounts: List[int] = []
     cp_bindptr = np.zeros(n + 1, dtype=np.int64)
     cp_totals = np.zeros(n, dtype=np.int32)
+    cp_year_sum = np.zeros(n, dtype=np.float32)
+    cp_year_n = np.zeros(n, dtype=np.int32)
 
     acc: Optional[_UserAccumulator] = None
     current_user = None
@@ -418,9 +450,13 @@ def build(
             cp_bcounts.append(cnt)
         cp_bindptr[idx + 1] = len(cp_brands)
         cp_totals[idx] = acc.n
+        cp_year_sum[idx] = acc.year_sum
+        cp_year_n[idx] = acc.year_n
 
         # ---- only now does the current event become history ---------------
-        price, cat, brand = lookup.get(int(row.item_id), (float("nan"), "", ""))
+        price, cat, brand, genres, year = lookup.get(
+            int(row.item_id), (float("nan"), "", "", [], float("nan"))
+        )
         acc.update(
             item_id=int(row.item_id),
             rating=float(row.rating),
@@ -432,7 +468,9 @@ def build(
             else float("nan"),
             price=price,
             category=cat,
+            categories=genres,
             brand=brand,
+            year=year,
             positive_threshold=pos_threshold,
         )
 
@@ -464,6 +502,8 @@ def build(
             brand_ids=np.array(cp_brands, dtype=object),
             brand_counts=np.array(cp_bcounts, dtype=np.int32),
             totals=cp_totals,
+            year_sum=cp_year_sum,
+            year_n=cp_year_n,
         ),
     )
 
@@ -488,6 +528,8 @@ def save(store: FeatureStore, out_dir: Path) -> None:
             cp_brand_ids=cp.brand_ids,
             cp_brand_counts=cp.brand_counts,
             cp_totals=cp.totals,
+            cp_year_sum=cp.year_sum,
+            cp_year_n=cp.year_n,
         )
     np.savez_compressed(out_dir / "user_features.npz", **arrays)
 
@@ -506,6 +548,8 @@ def load(out_dir: Path) -> FeatureStore:
             brand_ids=arrays["cp_brand_ids"],
             brand_counts=arrays["cp_brand_counts"],
             totals=arrays["cp_totals"],
+            year_sum=arrays["cp_year_sum"],
+            year_n=arrays["cp_year_n"],
         )
     return FeatureStore(
         frame=frame,

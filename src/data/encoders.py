@@ -89,6 +89,11 @@ class ItemTable:
     cat_l1_ids: np.ndarray
     cat_leaf_ids: np.ndarray
     popularity: np.ndarray  # raw train counts, used for negative sampling
+    # Multi-label categories (MovieLens genres) as CSR over item ids; both
+    # empty for datasets that carry a single leaf per item (Amazon).
+    genre_indptr: np.ndarray = None  # (n_items + 2,)
+    genre_ids: np.ndarray = None  # (nnz,)
+    year: np.ndarray = None  # (n_items + 1,) float, 0 for missing
 
     @property
     def n_items(self) -> int:
@@ -127,6 +132,18 @@ def _log1p(series: pd.Series) -> np.ndarray:
     return np.log1p(values)
 
 
+def _series_or_empty(items: pd.DataFrame, col: str, dtype) -> pd.Series:
+    """Column if present, else an empty Series of the right dtype.
+
+    Datasets differ in which item-side columns they carry (Amazon has price,
+    MovieLens does not); every consumer below must be able to handle a missing
+    column without special-casing.
+    """
+    if col in items.columns:
+        return items[col]
+    return pd.Series(np.nan, index=items.index, dtype=dtype)
+
+
 def _build_item_table(
     items: pd.DataFrame,
     train_interactions: pd.DataFrame,
@@ -153,14 +170,20 @@ def _build_item_table(
     cat_l1_ids = np.zeros(size, dtype=np.int64)
     cat_leaf_ids = np.zeros(size, dtype=np.int64)
     popularity = np.zeros(size, dtype=np.float64)
+    # Multi-label genre sets (MovieLens) as CSR over item ids; empty for
+    # datasets without a genres column (Amazon).
+    genres = items.get("genres")
+    genre_indptr = np.zeros(size + 1, dtype=np.int64)
+    genre_ids = np.zeros(size, dtype=np.int64)  # over-allocated; sliced below
+    item_year = np.zeros(size, dtype=np.float64)
 
-    price_raw = pd.to_numeric(items.get("price"), errors="coerce")
-    rank_raw = pd.to_numeric(items.get("sales_rank"), errors="coerce")
+    price_raw = pd.to_numeric(_series_or_empty(items, "price", float), errors="coerce")
+    rank_raw = pd.to_numeric(_series_or_empty(items, "sales_rank", float), errors="coerce")
     price_log = np.log1p(price_raw.fillna(0.0).clip(lower=0.0).to_numpy())
     rank_log = np.log1p(rank_raw.fillna(0.0).clip(lower=0.0).to_numpy())
-    title_log = _log1p(items["title_len"])
-    ab_log = _log1p(items["n_also_bought"])
-    av_log = _log1p(items["n_also_viewed"])
+    title_log = _log1p(_series_or_empty(items, "title_len", float))
+    ab_log = _log1p(_series_or_empty(items, "n_also_bought", float))
+    av_log = _log1p(_series_or_empty(items, "n_also_viewed", float))
 
     idx = items["item_id"].to_numpy(dtype=np.int64)
     dense[idx, 0] = price_log
@@ -191,6 +214,32 @@ def _build_item_table(
     cat_l1_ids[idx] = cat_l1_vocab.encode_many(items["cat_l1"])
     cat_leaf_ids[idx] = cat_leaf_vocab.encode_many(items["cat_leaf"])
 
+    row_year = pd.to_numeric(_series_or_empty(items, "year", float), errors="coerce")
+    item_year[idx] = row_year.fillna(0.0).to_numpy()
+
+    if genres is not None:
+        # Each item contributes its whole genre set, encoded into the cat_leaf
+        # vocab (movie genres live in the same id space as Amazon's leaves).
+        flat = []
+        locs = []
+        for i, row in enumerate(items.itertuples(index=False)):
+            g = list(getattr(row, "genres", ()) or ())
+            ids = cat_leaf_vocab.encode_many(g)
+            gid = int(row.item_id)
+            flat.extend(ids)
+            locs.extend([gid] * len(ids))
+        if flat:
+            flat_arr = np.asarray(flat, dtype=np.int64)
+            locs_arr = np.asarray(locs, dtype=np.int64)
+            # Order by (item_id, position) so the CSR is contiguous and stable.
+            order = np.lexsort((np.arange(len(flat_arr)), locs_arr))
+            flat_arr = flat_arr[order]
+            locs_arr = locs_arr[order]
+            genre_ids = flat_arr
+            genre_indptr[1:] = np.bincount(locs_arr, minlength=size).cumsum()
+        else:
+            genre_ids = np.zeros(0, dtype=np.int64)
+
     # Padding row must stay neutral.
     dense[PAD] = 0.0
     return ItemTable(
@@ -199,6 +248,9 @@ def _build_item_table(
         cat_l1_ids=cat_l1_ids,
         cat_leaf_ids=cat_leaf_ids,
         popularity=popularity,
+        genre_indptr=genre_indptr[: size + 1],
+        genre_ids=genre_ids,
+        year=item_year,
     )
 
 
@@ -280,6 +332,9 @@ def save(encoders: Encoders, out_dir: Path) -> None:
         item_cat_l1=encoders.item_table.cat_l1_ids,
         item_cat_leaf=encoders.item_table.cat_leaf_ids,
         item_pop=encoders.item_table.popularity,
+        item_genre_indptr=encoders.item_table.genre_indptr,
+        item_genre_ids=encoders.item_table.genre_ids,
+        item_year=encoders.item_table.year,
     )
 
 
@@ -298,6 +353,9 @@ def load(out_dir: Path) -> Encoders:
             cat_l1_ids=arrays["item_cat_l1"],
             cat_leaf_ids=arrays["item_cat_leaf"],
             popularity=arrays["item_pop"],
+            genre_indptr=(arrays["item_genre_indptr"] if "item_genre_indptr" in arrays else None),
+            genre_ids=(arrays["item_genre_ids"] if "item_genre_ids" in arrays else None),
+            year=(arrays["item_year"] if "item_year" in arrays else None),
         ),
         n_users=int(vocabs["n_users"]),
     )

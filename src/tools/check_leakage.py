@@ -92,7 +92,7 @@ def check_split_order(store) -> None:
     LOGGER.info("split chronology OK (%d users)", len(complete))
 
 
-def check_iqp_no_leakage(store, cfg=None) -> None:
+def check_iqp_no_leakage(store, cfg=None, items=None) -> None:
     """The cross features must not encode the label.
 
     Three assertions, each guarding a distinct failure mode:
@@ -114,23 +114,53 @@ def check_iqp_no_leakage(store, cfg=None) -> None:
     if cp is None:
         raise AssertionError("cat_profile missing; features must be rebuilt")
 
-    # (1) causality: nnz counts sum to the number of prior events.
+    # (1) causality: nnz counts must equal the number of prior *category
+    # touches*. Multi-label datasets (MovieLens genres) add one count per
+    # genre, so the expected value is the cumulative sum of each prior event's
+    # genre count -- never just the event count. Falls back to event count
+    # when the items table carries no genres (Amazon).
+    n_cat = np.ones(len(frame), dtype=np.int64)
+    has_year = np.zeros(len(frame), dtype=np.int64)
+    if items is not None and "genres" in items.columns:
+        per_item_cat = {}
+        per_item_year = {}
+        for row in items.itertuples(index=False):
+            g = list(getattr(row, "genres", ()) or ())
+            per_item_cat[int(row.item_id)] = len(g) if g else 0
+            per_item_year[int(row.item_id)] = int(
+                not pd.isna(getattr(row, "year", np.nan))
+            )
+        item_ids = frame["item_id"].to_numpy()
+        n_cat = np.array(
+            [per_item_cat.get(int(i), 0) for i in item_ids], dtype=np.int64
+        )
+        has_year = np.array(
+            [per_item_year.get(int(i), 0) for i in item_ids], dtype=np.int64
+        )
+
     users = frame["user_id"].to_numpy()
-    seen_n = {}
+    seen_cat, seen_year = {}, {}
     bad = 0
+    bad_year = 0
     for i in range(len(frame)):
         u = users[i]
-        expected = seen_n.get(u, 0)
+        expected_cat = seen_cat.get(u, 0)
+        expected_year = seen_year.get(u, 0)
         lo, hi = int(cp.indptr[i]), int(cp.indptr[i + 1])
         got = int(cp.cat_counts[lo:hi].sum())
-        # Categories can be blank for some items, so the snapshot total is a
-        # lower bound on the event count, never an over-count.
-        if got > expected:
+        if got > expected_cat:
             bad += 1
-        seen_n[u] = expected + 1
+        if int(cp.year_n[i]) > expected_year:
+            bad_year += 1
+        seen_cat[u] = expected_cat + int(n_cat[i])
+        seen_year[u] = expected_year + int(has_year[i])
     if bad:
         raise AssertionError(
             f"category snapshot sees the future on {bad} rows"
+        )
+    if bad_year:
+        raise AssertionError(
+            f"year snapshot sees the future on {bad_year} rows"
         )
     LOGGER.info("IQP snapshot causality OK (%d rows)", len(frame))
 
@@ -219,7 +249,7 @@ def main() -> None:
     check_history_causality(store, interactions)
     check_dense_recompute(store, interactions)
     check_split_order(store)
-    check_iqp_no_leakage(store, cfg)
+    check_iqp_no_leakage(store, cfg, items=items)
     LOGGER.info("all leakage checks passed")
 
 

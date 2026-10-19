@@ -240,6 +240,9 @@ def build_dataloaders(
             encoders.item_table.brand_ids,
             encoders.cat_leaf_vocab,
             encoders.brand_vocab,
+            item_genre_indptr=encoders.item_table.genre_indptr,
+            item_genre_ids=encoders.item_table.genre_ids,
+            item_year=encoders.item_table.year,
         )
 
     train = TrainDataset(
