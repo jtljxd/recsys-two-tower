@@ -19,7 +19,6 @@ import pandas as pd
 
 from ..config import default_config
 from ..data import features as features_mod
-from ..data import parse_amazon
 from ..utils import get_logger, load_table, table_exists
 
 LOGGER = get_logger()
@@ -93,7 +92,7 @@ def check_split_order(store) -> None:
     LOGGER.info("split chronology OK (%d users)", len(complete))
 
 
-def check_iqp_no_leakage(store) -> None:
+def check_iqp_no_leakage(store, cfg=None) -> None:
     """The cross features must not encode the label.
 
     Three assertions, each guarding a distinct failure mode:
@@ -163,7 +162,7 @@ def check_iqp_no_leakage(store) -> None:
     from ..data import encoders as encoders_mod
     from ..data.iqp import IQP_FEATURES
 
-    cfg = default_config()
+    cfg = cfg or default_config()
     cfg.model.use_interactrank = True
     enc = encoders_mod.load(cfg.processed_dir)
     train_loader, _, _ = dataset_mod.build_dataloaders(store, enc, cfg)
@@ -195,12 +194,23 @@ def check_iqp_no_leakage(store) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-dir", type=str, default=None)
+    parser.add_argument(
+        "--dataset", type=str, default="amazon-electronics",
+        choices=["amazon-electronics", "ml-1m"],
+    )
     args = parser.parse_args()
 
+    from ..config import processed_dir_for
+    from ..data import parse_amazon, parse_ml1m
+
     cfg = default_config()
+    cfg.data.dataset = args.dataset
+    cfg.processed_dir = processed_dir_for(args.dataset)
     cfg.data.sample_users = None
     if not table_exists(cfg.processed_dir, "interactions"):
-        parse_amazon.run(cfg, raw_dir=Path(args.raw_dir) if args.raw_dir else None)
+        (parse_amazon if args.dataset == "amazon-electronics" else parse_ml1m).run(
+            cfg, raw_dir=Path(args.raw_dir) if args.raw_dir else None
+        )
 
     interactions = load_table(cfg.processed_dir, "interactions")
     items = load_table(cfg.processed_dir, "items")
@@ -209,7 +219,7 @@ def main() -> None:
     check_history_causality(store, interactions)
     check_dense_recompute(store, interactions)
     check_split_order(store)
-    check_iqp_no_leakage(store)
+    check_iqp_no_leakage(store, cfg)
     LOGGER.info("all leakage checks passed")
 
 
