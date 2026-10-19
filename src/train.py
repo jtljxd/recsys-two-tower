@@ -246,12 +246,18 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--loss", type=str, default=None, choices=["bce", "softmax"])
     parser.add_argument("--force", action="store_true", help="ignore cached parquet files")
+    parser.add_argument(
+        "--artifact-dir", type=str, default=None,
+        help="where to write report.json / best_model.pt",
+    )
     args = parser.parse_args()
 
     cfg = default_config()
     cfg.data.dataset = args.dataset
     # Per-dataset cache so switching datasets never clobbers each other's features.
     cfg.processed_dir = processed_dir_for(args.dataset)
+    if args.artifact_dir is not None:
+        cfg.artifact_dir = Path(args.artifact_dir)
     if args.sample_users is not None:
         cfg.data.sample_users = None if args.sample_users <= 0 else args.sample_users
     if args.min_item_interactions is not None:
