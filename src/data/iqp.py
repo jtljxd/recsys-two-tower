@@ -85,6 +85,16 @@ def build_iqp_table(frame: pd.DataFrame) -> IQPTable:
     return IQPTable(item_total=item_total, grand_total=grand_total)
 
 
+def _bits(genre_ids: np.ndarray) -> int:
+    """Genre id set -> integer bitmask. Genres are few (<=3 per item, ~28 per
+    user), so even Amazon's ~2000-deep vocab fits machine words; intersection
+    is a single Python-int AND instead of numpy calls per candidate."""
+    bits = 0
+    for g in genre_ids:
+        bits |= 1 << int(g)
+    return bits
+
+
 class IQPLookup:
     """Per-candidate cross features, computed inside the Dataset.
 
@@ -166,7 +176,15 @@ class IQPLookup:
         year_n = int(cp.year_n[row])
         mean_year = float(cp.year_sum[row]) / year_n if year_n else 0.0
         rlo, rhi = int(cp.recent_indptr[row]), int(cp.recent_indptr[row + 1])
-        recent_items = cp.recent_ids[rlo:rhi]
+        # Bitmasks of each recent item's genres, computed once per row: every
+        # candidate's recency test is then a bare Python-int AND, not a numpy
+        # call per (candidate, recent item).
+        recent_bits = []
+        if rhi > rlo:
+            for rid in cp.recent_ids[rlo:rhi]:
+                rg = self._candidate_genres(int(rid))
+                if len(rg):
+                    recent_bits.append(_bits(rg))
 
         for j, item in enumerate(items):
             item = int(item)
@@ -204,13 +222,14 @@ class IQPLookup:
             out[j, 6] = _global_prior(self.table, item)
 
             # (7) recency: how many of the user's last items share a genre.
-            if rhi > rlo and len(genre_ids):
-                hit = 0
-                for rid in recent_items:
-                    rg = self._candidate_genres(int(rid))
-                    if len(rg) and np.isin(rg, genre_ids).any():
-                        hit += 1
-                out[j, 7] = np.log1p(hit)
+            if recent_bits:
+                cb = _bits(genre_ids)
+                if cb:
+                    hit = 0
+                    for b in recent_bits:
+                        if b & cb:
+                            hit += 1
+                    out[j, 7] = np.log1p(hit)
 
         # (8..) user statistics -- row-level, broadcast over all candidates.
         if self.user_stats is not None and row < len(self.user_stats):
