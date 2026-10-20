@@ -33,14 +33,16 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
-from .features import DENSE_FEATURES
+from .features import DENSE_FEATURES, USER_ATTR_COLS
 
 LOGGER = logging.getLogger(__name__)
 
 # Order is fixed: the model's affine layer indexes these positionally.
-# The first block is candidate-dependent cross behaviour; the last block is the
-# user's own statistics (identical for every candidate in a row), appended so
-# the scoring head can act as an IQP_p(q, c) prior conditioned on the user.
+# First block: candidate-dependent cross behaviour.
+# Second block: cohort priors, (user attribute value, candidate genre).
+# Last block: the user's own statistics (identical for every candidate in a
+# row), appended so the head can act as an IQP_p(q, c) prior conditioned on the
+# user.
 IQP_FEATURES = (
     "xf_cat_cnt",  # user's interactions across the candidate's genres
     "xf_cat_ratio",  # that as a share of the user's history
@@ -50,6 +52,9 @@ IQP_FEATURES = (
     "xf_year_diff",  # |candidate year - user's mean watched year|, log1p
     "xf_global",  # item's global popularity prior (train split only)
     "xf_recent_cnt",  # last-≤max_seq_len events sharing a genre with candidate
+    "xf_gender_genre",  # cohort: gender x candidate genre, train positive rate
+    "xf_age_genre",  # cohort: age bucket x candidate genre
+    "xf_occupation_genre",  # cohort: occupation x candidate genre
 ) + tuple("xf_user_" + n for n in DENSE_FEATURES)
 
 
@@ -95,6 +100,64 @@ def _bits(genre_ids: np.ndarray) -> int:
     return bits
 
 
+def build_attr_genre_table(frame: pd.DataFrame, encoders) -> Dict[str, np.ndarray]:
+    """(attribute value, genre id) -> smoothed positive rate, TRAIN split only.
+
+    Cohort priors for gender/age/occupation x candidate genre: for every
+    attribute value and every genre in the vocab, the share of that (value,
+    genre)'s training interactions that were positive, Laplace-smoothed
+    (pos+1)/(tot+2). A female user seeing a drama candidate reads
+    table[gender=2][drama]; the transfer across all users sharing the attribute
+    is exactly what a per-user xf_cat_* cannot provide (no history in that
+    genre yet). All stats come from the training split only, and the current
+    sample's label is temporal-later than the training split by construction,
+    so nothing leaks.
+
+    Column 0 of each table holds the genre-agnostic positive rate of that
+    attribute value (the model's fallback for OOV genres).
+    """
+    it = encoders.item_table
+    if getattr(it, "genre_ids", None) is None or len(it.genre_ids) == 0:
+        return {}
+    indptr, ids = it.genre_indptr, it.genre_ids
+    n_vocab = len(encoders.cat_leaf_vocab) + 1  # ids are 1-based; 0 = unknown
+    train_ids = np.flatnonzero((frame["split"] == "train").to_numpy())
+    item_ids = frame["item_id"].to_numpy()
+    labels = frame["label"].to_numpy()
+
+    def item_genres(item: int) -> np.ndarray:
+        lo, hi = int(indptr[item]), int(indptr[item + 1])
+        return ids[lo:hi]
+
+    tables = {}
+    for attr in USER_ATTR_COLS:
+        if attr not in frame.columns:
+            continue
+        col = frame[attr].to_numpy()
+        n_vals = int(np.nanmax(col)) + 1
+        pos = np.zeros((n_vals + 1, n_vocab), dtype=np.float64)
+        tot = np.zeros((n_vals + 1, n_vocab), dtype=np.float64)
+        for i in train_ids:
+            a = int(col[i])
+            gs = item_genres(int(item_ids[i]))
+            if a <= 0 or len(gs) == 0:
+                continue
+            pos[a, gs] += labels[i]
+            tot[a, gs] += 1.0
+        table = (pos + 1.0) / (tot + 2.0)
+        # genre-agnostic prior per attribute value -> column 0.
+        table[:, 0] = (pos.sum(axis=1) + 1.0) / (tot.sum(axis=1) + 2.0)
+        tables[attr] = table.astype(np.float32)
+        LOGGER.info(
+            "IQP cohort prior | %s values=%d hit=%d of %d train rows",
+            attr,
+            n_vals,
+            int((col[train_ids] > 0).sum()),
+            len(train_ids),
+        )
+    return tables
+
+
 class IQPLookup:
     """Per-candidate cross features, computed inside the Dataset.
 
@@ -115,6 +178,8 @@ class IQPLookup:
         item_genre_ids=None,
         item_year=None,
         user_stats=None,
+        attr_values=None,
+        attr_tables=None,
     ):
         self.table = table
         self.cp = cat_profile
@@ -135,6 +200,9 @@ class IQPLookup:
             if user_stats is not None
             else None
         )
+        # Per-row static user attributes and (attr value, genre) cohort tables.
+        self.attr_values = attr_values or {}
+        self.attr_tables = attr_tables or {}
         # The snapshots store raw strings; encode once here so the per-row
         # lookups compare integers.
         self.cat_ids = cat_vocab.encode_many(cat_profile.cat_ids)
@@ -160,9 +228,9 @@ class IQPLookup:
         split slicing.
         """
         cp = self.cp
-        # 8 candidate-dependent cross features; everything after is the user's
-        # own statistics, constant across the row's candidates.
-        n_cross = 8
+        # 11 candidate-dependent cross features (8 behaviour + 3 cohort priors);
+        # everything after is the user's own statistics, constant per row.
+        n_cross = 11
         out = np.zeros((len(items), len(IQP_FEATURES)), dtype=np.float32)
 
         lo, hi = int(cp.indptr[row]), int(cp.indptr[row + 1])
@@ -230,6 +298,18 @@ class IQPLookup:
                         if b & cb:
                             hit += 1
                     out[j, 7] = np.log1p(hit)
+
+            # (8-10) cohort priors: (user attribute value, candidate genre).
+            if len(genre_ids):
+                for k, attr in enumerate(USER_ATTR_COLS):
+                    t = self.attr_tables.get(attr)
+                    av = self.attr_values.get(attr)
+                    if t is None or av is None:
+                        continue
+                    a = int(av[row])
+                    if a <= 0 or a >= t.shape[0]:
+                        continue
+                    out[j, 8 + k] = float(t[a, genre_ids].mean())
 
         # (8..) user statistics -- row-level, broadcast over all candidates.
         if self.user_stats is not None and row < len(self.user_stats):

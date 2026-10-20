@@ -62,6 +62,11 @@ DENSE_FEATURES: Tuple[str, ...] = (
     "month_cos",
 )
 
+# Static user attributes that cross candidate genres (MovieLens users.dat).
+# Carried from the interactions table into the samples frame, and consumed by
+# the IQP cohort features (gender/age/occupation x candidate genre).
+USER_ATTR_COLS: Tuple[str, ...] = ("gender", "age", "occupation")
+
 
 @dataclass
 class CatProfile:
@@ -488,6 +493,9 @@ def build(
         )
 
     frame = df[["user_id", "item_id", "timestamp", "rating", "split"]].copy()
+    for col in USER_ATTR_COLS:
+        if col in df.columns:
+            frame[col] = df[col].to_numpy().astype(np.int64)
     frame["label"] = (frame["rating"] >= pos_threshold).astype(np.float32)
     frame["top_cat"] = top_cats
     frame["top_brand"] = top_brands

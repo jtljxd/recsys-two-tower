@@ -131,23 +131,54 @@ def _load_movies(path: Path) -> pd.DataFrame:
     return df
 
 
+def _load_users(path: Path) -> pd.DataFrame:
+    """UserID::Gender::Age::Occupation::Zip-code -> user attribute frame.
+
+    Gender codes 1=M, 2=F (0=unknown); age keeps the dataset's own bucket
+    numbers (1, 18, 25, 35, 45, 50, 56); occupation keeps its 0-20 code.
+    These are static per user, so they cannot leak across a user's own events.
+    """
+    rows = []
+    with path.open("rt", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("::")
+            if len(parts) < 3 or not parts[0].strip().isdigit():
+                continue
+            gender = {"M": 1, "F": 2}.get(parts[1].strip().upper(), 0)
+            try:
+                age = int(parts[2].strip())
+            except ValueError:
+                age = 0
+            occ = int(parts[3].strip()) if len(parts) > 3 and parts[3].strip().isdigit() else 0
+            rows.append((parts[0].strip(), gender, age, occ))
+    return pd.DataFrame(
+        rows, columns=["user_raw", "gender", "age", "occupation"]
+    )
+
+
 def run(cfg: Optional[Config] = None, raw_dir: Optional[Path] = None) -> Dict[str, Path]:
     cfg = cfg or default_config()
     set_seed(cfg.data.seed)
     raw_dir = Path(raw_dir) if raw_dir else cfg.raw_dir
     ratings_path = raw_dir / "ratings.dat"
     movies_path = raw_dir / "movies.dat"
-    for p in (ratings_path, movies_path):
+    users_path = raw_dir / "users.dat"
+    for p in (ratings_path, movies_path, users_path):
         if not p.exists():
             raise FileNotFoundError(
                 "missing MovieLens-1M file: {}\nPoint --raw-dir at the directory "
-                "containing ratings.dat and movies.dat.".format(p)
+                "containing ratings.dat, movies.dat and users.dat.".format(p)
             )
 
     with timed("loading ratings.dat", LOGGER):
         inter = _load_ratings(ratings_path)
     with timed("loading movies.dat", LOGGER):
         meta = _load_movies(movies_path)
+    with timed("loading users.dat", LOGGER):
+        users = _load_users(users_path)
     LOGGER.info(
         "raw: %d interactions, %d users, %d movies",
         len(inter),
@@ -178,6 +209,11 @@ def run(cfg: Optional[Config] = None, raw_dir: Optional[Path] = None) -> Dict[st
         )
 
     inter = _assign_ids(inter)
+    # Static user attributes join after id assignment (no items touched); the
+    # columns ride along into interactions.parquet and then the samples frame.
+    inter = inter.merge(users, on="user_raw", how="left")
+    for col in ("gender", "age", "occupation"):
+        inter[col] = inter[col].fillna(0).astype(np.int64)
     movie_ids = inter[["item_raw", "item_id"]].drop_duplicates().reset_index(drop=True)
     items = movie_ids.merge(meta, on="item_raw", how="left")
     items["brand"] = items["brand"].fillna("")

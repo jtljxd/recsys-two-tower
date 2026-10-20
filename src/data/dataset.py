@@ -17,7 +17,7 @@ from ..config import Config, default_config
 from ..utils import get_logger
 from .encoders import Encoders
 from .features import FeatureStore
-from .iqp import IQPLookup, build_iqp_table
+from .iqp import IQPLookup, build_attr_genre_table, build_iqp_table
 
 LOGGER = get_logger()
 
@@ -244,6 +244,12 @@ def build_dataloaders(
             item_genre_ids=encoders.item_table.genre_ids,
             item_year=encoders.item_table.year,
             user_stats=store.dense,
+            attr_values={
+                attr: store.frame[attr].to_numpy().astype(np.int64)
+                for attr in ("gender", "age", "occupation")
+                if attr in store.frame.columns
+            },
+            attr_tables=build_attr_genre_table(store.frame, encoders),
         )
 
     train = TrainDataset(
