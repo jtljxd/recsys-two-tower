@@ -243,6 +243,7 @@ def build_dataloaders(
             item_genre_indptr=encoders.item_table.genre_indptr,
             item_genre_ids=encoders.item_table.genre_ids,
             item_year=encoders.item_table.year,
+            item_pop=encoders.item_table.popularity,
             user_stats=store.dense,
             attr_values={
                 attr: store.frame[attr].to_numpy().astype(np.int64)

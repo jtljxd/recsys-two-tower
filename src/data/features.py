@@ -93,6 +93,7 @@ class CatProfile:
     year_n: np.ndarray  # (N,) int32 -- count of watched items with a year
     recent_indptr: np.ndarray  # (N + 1,) int64 -- CSR for last-≤max_seq_len items
     recent_ids: np.ndarray  # (nnz_r,) int64 -- item ids, strictly before the row
+    rating_sum: np.ndarray  # (N,) float32 -- raw rating total (for mean-affinity)
 
 
 @dataclass
@@ -423,6 +424,7 @@ def build(
     cp_year_n = np.zeros(n, dtype=np.int32)
     recent_ids: List[int] = []
     recent_indptr = np.zeros(n + 1, dtype=np.int64)
+    cp_rating_sum = np.zeros(n, dtype=np.float32)
 
     acc: Optional[_UserAccumulator] = None
     current_user = None
@@ -470,6 +472,7 @@ def build(
         cp_year_n[idx] = acc.year_n
         recent_ids.extend(acc.recent_items)
         recent_indptr[idx + 1] = len(recent_ids)
+        cp_rating_sum[idx] = acc.rating_sum
 
         # ---- only now does the current event become history ---------------
         price, cat, brand, genres, year = lookup.get(
@@ -527,6 +530,7 @@ def build(
             year_n=cp_year_n,
             recent_indptr=recent_indptr,
             recent_ids=np.array(recent_ids, dtype=np.int64),
+            rating_sum=cp_rating_sum,
         ),
     )
 
@@ -555,6 +559,7 @@ def save(store: FeatureStore, out_dir: Path) -> None:
             cp_year_n=cp.year_n,
             cp_recent_indptr=cp.recent_indptr,
             cp_recent_ids=cp.recent_ids,
+            cp_rating_sum=cp.rating_sum,
         )
     np.savez_compressed(out_dir / "user_features.npz", **arrays)
 
@@ -577,6 +582,7 @@ def load(out_dir: Path) -> FeatureStore:
             year_n=arrays["cp_year_n"],
             recent_indptr=(arrays["cp_recent_indptr"] if "cp_recent_indptr" in arrays else np.zeros(len(arrays["cp_indptr"]), dtype=np.int64)),
             recent_ids=(arrays["cp_recent_ids"] if "cp_recent_ids" in arrays else np.zeros(0, dtype=np.int64)),
+            rating_sum=(arrays["cp_rating_sum"] if "cp_rating_sum" in arrays else np.zeros(len(arrays["cp_indptr"]) - 1, dtype=np.float32)),
         )
     return FeatureStore(
         frame=frame,

@@ -55,6 +55,10 @@ IQP_FEATURES = (
     "xf_gender_genre",  # cohort: gender x candidate genre, train positive rate
     "xf_age_genre",  # cohort: age bucket x candidate genre
     "xf_occupation_genre",  # cohort: occupation x candidate genre
+    "xf_cat_affinity",  # user's mean rating in these genres minus their overall mean
+    "xf_pop_affinity",  # candidate popularity vs the user's recent popularity taste
+    "xf_recent_ratio",  # share of the last-≤max_seq_len events sharing a genre
+    "xf_last_match",  # does the candidate share a genre with the last watched item
 ) + tuple("xf_user_" + n for n in DENSE_FEATURES)
 
 
@@ -177,6 +181,7 @@ class IQPLookup:
         item_genre_indptr=None,
         item_genre_ids=None,
         item_year=None,
+        item_pop=None,
         user_stats=None,
         attr_values=None,
         attr_tables=None,
@@ -193,6 +198,9 @@ class IQPLookup:
         )
         self.genre_ids = item_genre_ids
         self.item_year = item_year
+        self.item_pop = (
+            np.asarray(item_pop, dtype=np.float64) if item_pop is not None else None
+        )
         # (N, D) standardized user statistics; appended to the head's input so
         # the score can act as a user-conditioned prior.
         self.user_stats = (
@@ -220,6 +228,18 @@ class IQPLookup:
             return np.array([cat], dtype=np.int64)
         return np.zeros(0, dtype=np.int64)
 
+    def _item_bits(self, item: int) -> int:
+        """Genre bitset of an item in one shot (same fallback as above)."""
+        if self.genre_indptr is not None and item < len(self.genre_indptr) - 1:
+            lo = int(self.genre_indptr[item])
+            hi = int(self.genre_indptr[item + 1])
+            if hi > lo:
+                return _bits(self.genre_ids[lo:hi])
+        cat = int(self.item_cat[item]) if item < len(self.item_cat) else 0
+        if cat > 0:
+            return 1 << cat
+        return 0
+
     def __call__(self, row: int, items: np.ndarray) -> np.ndarray:
         """items (C,) -> (C, len(IQP_FEATURES)) float32.
 
@@ -228,9 +248,10 @@ class IQPLookup:
         split slicing.
         """
         cp = self.cp
-        # 11 candidate-dependent cross features (8 behaviour + 3 cohort priors);
-        # everything after is the user's own statistics, constant per row.
-        n_cross = 11
+        # 15 candidate-dependent cross features (8 behaviour + 3 cohort priors
+        # + 4 affinity/recency variants); everything after is the user's own
+        # statistics, constant per row.
+        n_cross = 15
         out = np.zeros((len(items), len(IQP_FEATURES)), dtype=np.float32)
 
         lo, hi = int(cp.indptr[row]), int(cp.indptr[row + 1])
@@ -243,16 +264,32 @@ class IQPLookup:
         total = int(cp.totals[row])
         year_n = int(cp.year_n[row])
         mean_year = float(cp.year_sum[row]) / year_n if year_n else 0.0
+        # Raw mean rating over the user's whole history (for the difference
+        # affinity: rating inside a genre minus this baseline).
+        user_mean_rating = (
+            float(cp.rating_sum[row]) / total if total else 0.0
+        )
         rlo, rhi = int(cp.recent_indptr[row]), int(cp.recent_indptr[row + 1])
         # Bitmasks of each recent item's genres, computed once per row: every
         # candidate's recency test is then a bare Python-int AND, not a numpy
         # call per (candidate, recent item).
         recent_bits = []
+        recent_pop = 0.0
+        last_bits = 0
         if rhi > rlo:
-            for rid in cp.recent_ids[rlo:rhi]:
+            recent_ids_slice = cp.recent_ids[rlo:rhi]
+            last_bits = self._item_bits(int(recent_ids_slice[0]))
+            pop_sum = 0.0
+            pop_n = 0
+            for rid in recent_ids_slice:
                 rg = self._candidate_genres(int(rid))
                 if len(rg):
                     recent_bits.append(_bits(rg))
+                if self.item_pop is not None and int(rid) < len(self.item_pop):
+                    pop_sum += float(self.item_pop[int(rid)])
+                    pop_n += 1
+            if pop_n:
+                recent_pop = pop_sum / pop_n
 
         for j, item in enumerate(items):
             item = int(item)
@@ -267,6 +304,9 @@ class IQPLookup:
                 out[j, 0] = np.log1p(c)
                 out[j, 1] = c / total if total else 0.0
                 out[j, 2] = r / c if c else 0.0
+                # Difference affinity: genre-specific mean minus the user's
+                # overall mean, so a 4.0-rater is not confused with a 3.5-rater.
+                out[j, 11] = out[j, 2] - user_mean_rating
 
             # (3) brand behaviour (structurally absent on MovieLens).
             bhit = np.flatnonzero(brands == brand)
@@ -289,15 +329,24 @@ class IQPLookup:
             # (6) global popularity prior.
             out[j, 6] = _global_prior(self.table, item)
 
-            # (7) recency: how many of the user's last items share a genre.
-            if recent_bits:
-                cb = _bits(genre_ids)
-                if cb:
-                    hit = 0
-                    for b in recent_bits:
-                        if b & cb:
-                            hit += 1
-                    out[j, 7] = np.log1p(hit)
+            # (7-10) recency: how many of the user's last items share a genre, its
+            # share, the popularity-taste gap, and the last-item match.
+            cb = _bits(genre_ids)
+            if recent_bits and cb:
+                hit = 0
+                for b in recent_bits:
+                    if b & cb:
+                        hit += 1
+                out[j, 7] = np.log1p(hit)
+                out[j, 12] = hit / len(recent_bits)
+            if cb and last_bits & cb:
+                out[j, 14] = 1.0
+            if self.item_pop is not None and item < len(self.item_pop):
+                cand_pop = float(self.item_pop[item])
+                if recent_pop > 0 or cand_pop > 0:
+                    out[j, 13] = float(
+                        np.log1p(cand_pop) - np.log1p(recent_pop)
+                    )
 
             # (8-10) cohort priors: (user attribute value, candidate genre).
             if len(genre_ids):
