@@ -343,7 +343,14 @@ def _item_lookup(items: pd.DataFrame) -> Dict[int, Tuple[float, str, str, list, 
     lookup = {}
     for row in items.itertuples(index=False):
         price = getattr(row, "price", np.nan)
-        genres = list(getattr(row, "genres", ()) or ())
+        # Parquet round-trips decode list cells as either Python lists or
+        # numpy arrays depending on the pandas/pyarrow version; never test the
+        # container's truthiness (that raises on arrays with len > 1).
+        genres = getattr(row, "genres", None)
+        if genres is None or (isinstance(genres, float) and math.isnan(genres)):
+            genres = []
+        else:
+            genres = list(genres)
         year = getattr(row, "year", np.nan)
         try:
             year = float(year)

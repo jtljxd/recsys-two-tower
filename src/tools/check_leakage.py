@@ -125,8 +125,10 @@ def check_iqp_no_leakage(store, cfg=None, items=None) -> None:
         per_item_cat = {}
         per_item_year = {}
         for row in items.itertuples(index=False):
-            g = list(getattr(row, "genres", ()) or ())
-            per_item_cat[int(row.item_id)] = len(g) if g else 0
+            g = getattr(row, "genres", None)
+            if g is None or (isinstance(g, float) and pd.isna(g)):  # NaN cell
+                g = []
+            per_item_cat[int(row.item_id)] = len(g)
             per_item_year[int(row.item_id)] = int(
                 not pd.isna(getattr(row, "year", np.nan))
             )

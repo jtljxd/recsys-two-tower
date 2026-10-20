@@ -223,7 +223,11 @@ def _build_item_table(
         flat = []
         locs = []
         for i, row in enumerate(items.itertuples(index=False)):
-            g = list(getattr(row, "genres", ()) or ())
+            g = getattr(row, "genres", None)
+            if g is None or (isinstance(g, float) and g != g):  # NaN cell
+                g = []
+            else:
+                g = list(g)
             ids = cat_leaf_vocab.encode_many(g)
             gid = int(row.item_id)
             flat.extend(ids)
