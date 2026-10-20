@@ -291,6 +291,25 @@ class InteractRankModel(TwoTowerModel):
             self.interact.weight[0, 0] = 1.0 / float(self.cfg.temperature)
             self.interact.bias.zero_()
 
+        # Optional nonlinear correction: score = affine + MLP. Zero-initialized
+        # output layer keeps step-0 behaviour identical to the bare affine
+        # head; training then adds whatever interaction terms the linear layer
+        # cannot express (e.g. user statistics re-weighting the dot product,
+        # which no per-row constant feature can do through an affine map).
+        self.head_mlp = None
+        if getattr(self.cfg, "ir_mlp", False):
+            h = int(getattr(self.cfg, "ir_mlp_hidden", 64))
+            self.head_mlp = nn.Sequential(
+                nn.Linear(1 + n_iqp, h),
+                nn.ReLU(),
+                nn.Linear(h, 1),
+            )
+            with torch.no_grad():
+                self.head_mlp[0].weight.normal_(std=0.05)
+                self.head_mlp[0].bias.zero_()
+                self.head_mlp[2].weight.zero_()
+                self.head_mlp[2].bias.zero_()
+
     def forward(self, batch) -> torch.Tensor:
         u = self.encode_user(batch)
         v = self.encode_item(batch["items"])
@@ -303,4 +322,7 @@ class InteractRankModel(TwoTowerModel):
                 "with cfg.model.use_interactrank=True"
             )
         feats = torch.cat([dot.unsqueeze(-1), iqp], dim=-1)  # (B, C, 1+N)
-        return self.interact(feats).squeeze(-1)
+        out = self.interact(feats)
+        if self.head_mlp is not None:
+            out = out + self.head_mlp(feats)
+        return out.squeeze(-1)

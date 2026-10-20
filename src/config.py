@@ -75,6 +75,14 @@ class ModelConfig:
     # Replaces the temperature/bias with an affine layer over
     # [dot product, IQP cross-interaction features].
     use_interactrank: bool = False
+    # Optional nonlinear correction term on the same head input. Stays false by
+    # default to match the paper's affine form; when true, the score is
+    # affine(dot, features) + MLP(dot, features), and the MLP is zero-initialized
+    # so training starts from the affine baseline and learns interaction terms
+    # (e.g. user statistics modulating the dot product) that the linear layer
+    # cannot express.
+    ir_mlp: bool = False
+    ir_mlp_hidden: int = 64
 
 
 @dataclass

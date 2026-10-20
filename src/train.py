@@ -255,6 +255,11 @@ def main() -> None:
         "--model", type=str, default="base", choices=["base", "interactrank"]
     )
     parser.add_argument(
+        "--ir-mlp", action="store_true",
+        help="InteractRank: add a zero-initialized MLP correction to the affine "
+        "head (learns feature interactions the linear layer cannot express)",
+    )
+    parser.add_argument(
         "--artifact-dir", type=str, default=None,
         help="where to write report.json / best_model.pt",
     )
@@ -265,6 +270,8 @@ def main() -> None:
     # Per-dataset cache so switching datasets never clobbers each other's features.
     cfg.processed_dir = processed_dir_for(args.dataset)
     cfg.model.use_interactrank = args.model == "interactrank"
+    if args.ir_mlp:
+        cfg.model.ir_mlp = True
     if args.artifact_dir is not None:
         cfg.artifact_dir = Path(args.artifact_dir)
     elif cfg.model.use_interactrank:
