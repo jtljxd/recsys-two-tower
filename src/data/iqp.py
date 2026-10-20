@@ -33,9 +33,14 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
+from .features import DENSE_FEATURES
+
 LOGGER = logging.getLogger(__name__)
 
 # Order is fixed: the model's affine layer indexes these positionally.
+# The first block is candidate-dependent cross behaviour; the last block is the
+# user's own statistics (identical for every candidate in a row), appended so
+# the scoring head can act as an IQP_p(q, c) prior conditioned on the user.
 IQP_FEATURES = (
     "xf_cat_cnt",  # user's interactions across the candidate's genres
     "xf_cat_ratio",  # that as a share of the user's history
@@ -44,7 +49,8 @@ IQP_FEATURES = (
     "xf_genre_iou",  # Jaccard overlap between user's and candidate's genres
     "xf_year_diff",  # |candidate year - user's mean watched year|, log1p
     "xf_global",  # item's global popularity prior (train split only)
-)
+    "xf_recent_cnt",  # last-≤max_seq_len events sharing a genre with candidate
+) + tuple("xf_user_" + n for n in DENSE_FEATURES)
 
 
 @dataclass
@@ -98,6 +104,7 @@ class IQPLookup:
         item_genre_indptr=None,
         item_genre_ids=None,
         item_year=None,
+        user_stats=None,
     ):
         self.table = table
         self.cp = cat_profile
@@ -111,6 +118,13 @@ class IQPLookup:
         )
         self.genre_ids = item_genre_ids
         self.item_year = item_year
+        # (N, D) standardized user statistics; appended to the head's input so
+        # the score can act as a user-conditioned prior.
+        self.user_stats = (
+            np.asarray(user_stats, dtype=np.float32)
+            if user_stats is not None
+            else None
+        )
         # The snapshots store raw strings; encode once here so the per-row
         # lookups compare integers.
         self.cat_ids = cat_vocab.encode_many(cat_profile.cat_ids)
@@ -136,6 +150,9 @@ class IQPLookup:
         split slicing.
         """
         cp = self.cp
+        # 8 candidate-dependent cross features; everything after is the user's
+        # own statistics, constant across the row's candidates.
+        n_cross = 8
         out = np.zeros((len(items), len(IQP_FEATURES)), dtype=np.float32)
 
         lo, hi = int(cp.indptr[row]), int(cp.indptr[row + 1])
@@ -148,6 +165,8 @@ class IQPLookup:
         total = int(cp.totals[row])
         year_n = int(cp.year_n[row])
         mean_year = float(cp.year_sum[row]) / year_n if year_n else 0.0
+        rlo, rhi = int(cp.recent_indptr[row]), int(cp.recent_indptr[row + 1])
+        recent_items = cp.recent_ids[rlo:rhi]
 
         for j, item in enumerate(items):
             item = int(item)
@@ -183,6 +202,19 @@ class IQPLookup:
 
             # (6) global popularity prior.
             out[j, 6] = _global_prior(self.table, item)
+
+            # (7) recency: how many of the user's last items share a genre.
+            if rhi > rlo and len(genre_ids):
+                hit = 0
+                for rid in recent_items:
+                    rg = self._candidate_genres(int(rid))
+                    if len(rg) and np.isin(rg, genre_ids).any():
+                        hit += 1
+                out[j, 7] = np.log1p(hit)
+
+        # (8..) user statistics -- row-level, broadcast over all candidates.
+        if self.user_stats is not None and row < len(self.user_stats):
+            out[:, n_cross:] = self.user_stats[row]
 
         return out
 

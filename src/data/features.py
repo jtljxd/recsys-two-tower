@@ -86,6 +86,8 @@ class CatProfile:
     totals: np.ndarray  # (N,) int32 -- history length, the ratio denominator
     year_sum: np.ndarray  # (N,) float32 -- sum of watched-item release years
     year_n: np.ndarray  # (N,) int32 -- count of watched items with a year
+    recent_indptr: np.ndarray  # (N + 1,) int64 -- CSR for last-≤max_seq_len items
+    recent_ids: np.ndarray  # (nnz_r,) int64 -- item ids, strictly before the row
 
 
 @dataclass
@@ -414,6 +416,8 @@ def build(
     cp_totals = np.zeros(n, dtype=np.int32)
     cp_year_sum = np.zeros(n, dtype=np.float32)
     cp_year_n = np.zeros(n, dtype=np.int32)
+    recent_ids: List[int] = []
+    recent_indptr = np.zeros(n + 1, dtype=np.int64)
 
     acc: Optional[_UserAccumulator] = None
     current_user = None
@@ -459,6 +463,8 @@ def build(
         cp_totals[idx] = acc.n
         cp_year_sum[idx] = acc.year_sum
         cp_year_n[idx] = acc.year_n
+        recent_ids.extend(acc.recent_items)
+        recent_indptr[idx + 1] = len(recent_ids)
 
         # ---- only now does the current event become history ---------------
         price, cat, brand, genres, year = lookup.get(
@@ -511,6 +517,8 @@ def build(
             totals=cp_totals,
             year_sum=cp_year_sum,
             year_n=cp_year_n,
+            recent_indptr=recent_indptr,
+            recent_ids=np.array(recent_ids, dtype=np.int64),
         ),
     )
 
@@ -537,6 +545,8 @@ def save(store: FeatureStore, out_dir: Path) -> None:
             cp_totals=cp.totals,
             cp_year_sum=cp.year_sum,
             cp_year_n=cp.year_n,
+            cp_recent_indptr=cp.recent_indptr,
+            cp_recent_ids=cp.recent_ids,
         )
     np.savez_compressed(out_dir / "user_features.npz", **arrays)
 
@@ -557,6 +567,8 @@ def load(out_dir: Path) -> FeatureStore:
             totals=arrays["cp_totals"],
             year_sum=arrays["cp_year_sum"],
             year_n=arrays["cp_year_n"],
+            recent_indptr=(arrays["cp_recent_indptr"] if "cp_recent_indptr" in arrays else np.zeros(len(arrays["cp_indptr"]), dtype=np.int64)),
+            recent_ids=(arrays["cp_recent_ids"] if "cp_recent_ids" in arrays else np.zeros(0, dtype=np.int64)),
         )
     return FeatureStore(
         frame=frame,

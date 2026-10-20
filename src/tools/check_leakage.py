@@ -141,21 +141,27 @@ def check_iqp_no_leakage(store, cfg=None, items=None) -> None:
         )
 
     users = frame["user_id"].to_numpy()
-    seen_cat, seen_year = {}, {}
+    seen_cat, seen_year, seen_events = {}, {}, {}
     bad = 0
     bad_year = 0
+    bad_recent = 0
     for i in range(len(frame)):
         u = users[i]
         expected_cat = seen_cat.get(u, 0)
         expected_year = seen_year.get(u, 0)
+        expected_events = seen_events.get(u, 0)
         lo, hi = int(cp.indptr[i]), int(cp.indptr[i + 1])
         got = int(cp.cat_counts[lo:hi].sum())
         if got > expected_cat:
             bad += 1
         if int(cp.year_n[i]) > expected_year:
             bad_year += 1
+        rlo, rhi = int(cp.recent_indptr[i]), int(cp.recent_indptr[i + 1])
+        if rhi - rlo > expected_events:
+            bad_recent += 1
         seen_cat[u] = expected_cat + int(n_cat[i])
         seen_year[u] = expected_year + int(has_year[i])
+        seen_events[u] = expected_events + 1
     if bad:
         raise AssertionError(
             f"category snapshot sees the future on {bad} rows"
@@ -163,6 +169,10 @@ def check_iqp_no_leakage(store, cfg=None, items=None) -> None:
     if bad_year:
         raise AssertionError(
             f"year snapshot sees the future on {bad_year} rows"
+        )
+    if bad_recent:
+        raise AssertionError(
+            f"recent-item snapshot sees the future on {bad_recent} rows"
         )
     LOGGER.info("IQP snapshot causality OK (%d rows)", len(frame))
 

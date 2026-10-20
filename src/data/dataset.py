@@ -243,6 +243,7 @@ def build_dataloaders(
             item_genre_indptr=encoders.item_table.genre_indptr,
             item_genre_ids=encoders.item_table.genre_ids,
             item_year=encoders.item_table.year,
+            user_stats=store.dense,
         )
 
     train = TrainDataset(
