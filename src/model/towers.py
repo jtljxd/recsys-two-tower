@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from ..config import ModelConfig
 from ..data.iqp import IQP_FEATURES
+from .codebook import ResidualCodebook
 
 
 def _mlp(in_dim: int, hidden: Sequence[int], dropout: float) -> nn.Sequential:
@@ -79,6 +80,19 @@ class UserTower(nn.Module):
 
         in_dim = d_id * 2 + d_side * 2 + cfg.dense_hidden
         self.mlp = _mlp(in_dim, cfg.tower_hidden, cfg.dropout)
+        # The code is injected after the MLP rather than concatenated onto its
+        # input (see OursModel): the candidate-varying code must not force one
+        # row per (user, candidate) through the dropout inside the trunk.
+        self.code_fc = (
+            nn.Linear(cfg.n_code_levels * cfg.code_dim, cfg.tower_hidden[-1])
+            if cfg.use_codebook
+            else None
+        )
+        if self.code_fc is not None:
+            # Default init makes this branch 1.7x the trunk's norm; start it as
+            # a small perturbation and let the codebook gain grow it.
+            nn.init.normal_(self.code_fc.weight, std=0.01)
+            nn.init.zeros_(self.code_fc.bias)
         self.normalize = cfg.normalize
         self._init_weights()
 
@@ -101,7 +115,17 @@ class UserTower(nn.Module):
         dense: torch.Tensor,
         top_cat: torch.Tensor,
         top_brand: torch.Tensor,
+        code: Optional[torch.Tensor] = None,
+        expand: int = 1,
     ) -> torch.Tensor:
+        """expand > 1 repeats each row after the candidate-independent part.
+
+        The code varies per candidate, so one row per (user, candidate) has to
+        be emitted -- but expanding *before* the MLP would draw a fresh dropout
+        mask per copy and desynchronise a user's positive from their negatives
+        (measured 0.5265 spread on L2-normalized output). Computing the shared
+        part once and expanding afterwards keeps a single draw per user.
+        """
         # Masked mean-pooling over the behaviour sequence.
         mask = (hist_items != 0).float().unsqueeze(-1)  # (B, L, 1)
         seq = self.hist_item_emb(hist_items) * mask
@@ -116,6 +140,10 @@ class UserTower(nn.Module):
             self.dense_encoder(dense),
         ]
         out = self.mlp(torch.cat(parts, dim=-1))
+        if expand > 1:
+            out = out.repeat_interleave(expand, dim=0)
+        if code is not None:
+            out = out + self.code_fc(code)
         return F.normalize(out, p=2, dim=-1) if self.normalize else out
 
 
@@ -141,6 +169,15 @@ class ItemTower(nn.Module):
 
         in_dim = d_id + d_side * 3 + cfg.dense_hidden
         self.mlp = _mlp(in_dim, cfg.tower_hidden, cfg.dropout)
+        # Symmetric with the user side; see OursModel.
+        self.code_fc = (
+            nn.Linear(cfg.n_code_levels * cfg.code_dim, cfg.tower_hidden[-1])
+            if cfg.use_codebook
+            else None
+        )
+        if self.code_fc is not None:
+            nn.init.normal_(self.code_fc.weight, std=0.01)
+            nn.init.zeros_(self.code_fc.bias)
         self.normalize = cfg.normalize
         self._init_weights()
 
@@ -157,6 +194,7 @@ class ItemTower(nn.Module):
         cat_l1: torch.Tensor,
         cat_leaf: torch.Tensor,
         dense: torch.Tensor,
+        code: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         parts = [
             self.item_emb(item_id),
@@ -166,6 +204,8 @@ class ItemTower(nn.Module):
             self.dense_encoder(dense),
         ]
         out = self.mlp(torch.cat(parts, dim=-1))
+        if code is not None:
+            out = out + self.code_fc(code)
         return F.normalize(out, p=2, dim=-1) if self.normalize else out
 
 
@@ -326,3 +366,88 @@ class InteractRankModel(TwoTowerModel):
         if self.head_mlp is not None:
             out = out + self.head_mlp(feats)
         return out.squeeze(-1)
+
+
+class OursModel(InteractRankModel):
+    """InteractRank plus a residual codebook synchronising the two towers.
+
+    The affine layer over [dot product, cross features] is inherited unchanged,
+    so anything this model gains over InteractRank is attributable to the
+    codebook alone.
+
+    The cross features are lifted to a wider space before quantisation. 43
+    scalars, several of which are strongly correlated, carry enough structure
+    for the 64-way partition once projected: the centroids get room to separate
+    patterns. The code varies per candidate, so the user tower emits one row
+    per (row, candidate) -- but only after its MLP, keeping a single dropout
+    draw per user (see UserTower.expand).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        cfg = self.cfg
+        self.code_proj = nn.Sequential(
+            nn.Linear(len(IQP_FEATURES), cfg.code_proj_dim),
+            nn.ReLU(),
+        )
+        self.codebook = ResidualCodebook(
+            in_dim=cfg.code_proj_dim,
+            n_levels=cfg.n_code_levels,
+            codebook_size=cfg.codebook_size,
+            code_dim=cfg.code_dim,
+            dead_threshold=cfg.code_dead_threshold,
+            code_gain=cfg.code_gain,
+        )
+        self._last_indices = None
+        self._last_proj = None
+
+    def forward(self, batch) -> torch.Tensor:
+        iqp = batch.get("iqp")
+        if iqp is None:
+            raise KeyError(
+                "OursModel needs the 'iqp' batch key; build the dataloaders "
+                "with cfg.model.use_interactrank=True"
+            )
+        items = batch["items"]
+        B, C = items.shape
+
+        # One code per (row, candidate): the crossing varies with the candidate,
+        # so a single code per row would throw away exactly the signal we want.
+        proj = self.code_proj(iqp.reshape(B * C, -1))
+        u_code, v_code, indices = self.codebook(proj)
+        # Stashed for the training loop (codebook loss, occupancy log).
+        self._last_proj = proj
+        self._last_indices = indices
+
+        u = self.user_tower(
+            batch["user_id"],
+            batch["hist_items"],
+            batch["hist_len"],
+            batch["dense"],
+            batch["top_cat"],
+            batch["top_brand"],
+            code=u_code,
+            expand=C,
+        ).view(B, C, -1)
+
+        flat = items.reshape(-1)
+        v = self.item_tower(
+            flat,
+            self.item_brand[flat],
+            self.item_cat_l1[flat],
+            self.item_cat_leaf[flat],
+            self.item_dense[flat],
+            code=v_code,
+        ).view(B, C, -1)
+
+        dot = torch.einsum("bcd,bcd->bc", u, v)
+        feats = torch.cat([dot.unsqueeze(-1), iqp], dim=-1)
+        out = self.interact(feats)
+        if self.head_mlp is not None:
+            out = out + self.head_mlp(feats)
+        return out.squeeze(-1)
+
+    def codebook_loss(self) -> torch.Tensor:
+        if self._last_indices is None:
+            return torch.zeros((), device=self.item_dense.device)
+        return self.codebook.codebook_loss(self._last_proj, self._last_indices)

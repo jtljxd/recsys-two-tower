@@ -84,6 +84,23 @@ class ModelConfig:
     ir_mlp: bool = False
     ir_mlp_hidden: int = 64
 
+    # -- Residual codebook (ours / PairRQ) --------------------------------
+    # Quantises the projected cross features to a discrete index; both towers
+    # look that index up in their own table, so they synchronise without
+    # exchanging a continuous vector. 4^3 = 64 patterns from 12 centroids.
+    use_codebook: bool = False
+    code_proj_dim: int = 32
+    n_code_levels: int = 3
+    codebook_size: int = 4
+    code_dim: int = 16
+    # A centroid winning fewer samples than this in a batch is relocated into
+    # the busiest cluster rather than tracking its own empty mean.
+    code_dead_threshold: int = 10
+    code_loss_weight: float = 1.0
+    # Initial scale of the code block relative to the other tower inputs.
+    # Learnable, so this only sets the starting point.
+    code_gain: float = 0.3
+
 
 @dataclass
 class TrainConfig:
